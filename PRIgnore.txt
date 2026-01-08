@@ -43,3 +43,6 @@ CHANGELOG.md
 
 # Project files
 **/*.csproj
+
+# Frontend Types
+**/src/types.ts
