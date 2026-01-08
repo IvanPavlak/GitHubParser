@@ -427,6 +427,10 @@ class GitHubPRParser:
                 'body': comment['body'],
                 'code': comment.get('diff_hunk', ''),
                 'position': comment.get('position', 0),
+                'id': comment.get('id'),
+                'in_reply_to_id': comment.get('in_reply_to_id'),
+                'line': comment.get('line', 0),
+                'original_line': comment.get('original_line', 0),
             })
 
         return comments_by_file
@@ -477,28 +481,99 @@ class GitHubPRParser:
         comments_by_file = self.format_comments(comments)
 
         if comments_by_file:
+            # First, build conversation threads based on reply chains
+            all_threads = []
             for filepath, file_comments in comments_by_file.items():
                 if self.should_ignore(filepath):
                     continue
 
+                # Create a map of comment ID to comment
+                comment_map = {c['id']: c for c in file_comments}
+
+                # Find root comments (not replies to other comments)
+                root_comments = [c for c in file_comments if not c['in_reply_to_id']]
+
+                # Build threads: each root comment + all its replies
+                for root_comment in root_comments:
+                    thread = [root_comment]
+
+                    # Find all replies to this root comment
+                    replies = [c for c in file_comments if c['in_reply_to_id'] == root_comment['id']]
+                    thread.extend(replies)
+
+                    # Also check for nested replies (replies to replies)
+                    for reply in replies:
+                        nested_replies = [c for c in file_comments if c['in_reply_to_id'] == reply['id']]
+                        thread.extend(nested_replies)
+
+                    all_threads.append({
+                        'filepath': filepath,
+                        'comments': thread
+                    })
+
+            # Now process each thread with its own file header and code context
+            for thread in all_threads:
+                filepath = thread['filepath']
+                thread_comments = thread['comments']
+
+                # File header for each comment/conversation
                 feedback_md += f"### `{filepath}`\n\n"
 
-                for comment in file_comments:
-                    # Add code snippet if available
-                    if comment['code']:
-                        extension = self.get_file_extension(filepath)
-                        # Extract the commented line with 2 lines above and 2 lines below
-                        context_lines = self.extract_comment_context(comment['code'], context_before=2, context_after=2)
+                # Show code context for this thread
+                first_comment = thread_comments[0]
+                if first_comment['code']:
+                    extension = self.get_file_extension(filepath)
+                    context_lines = self.extract_comment_context(first_comment['code'], context_before=2, context_after=2)
 
-                        if context_lines:
-                            feedback_md += f"```{extension}\n"
-                            feedback_md += '\n'.join(context_lines)
-                            feedback_md += "\n```\n\n"
+                    if context_lines:
+                        feedback_md += f"```{extension}\n"
+                        feedback_md += '\n'.join(context_lines)
+                        feedback_md += "\n```\n\n"
 
-                    # Add comment
-                    feedback_md += f"- `{comment['author']}` → {comment['body']}\n"
+                # Format comments based on thread size
+                if len(thread_comments) == 1:
+                    # Single comment - use bullet format with cleaned body
+                    comment = thread_comments[0]
+                    # Clean up extra newlines in comment body
+                    clean_body = re.sub(r'\n\n+', '\n', comment['body']).strip()
+                    feedback_md += f"- `{comment['author']}` → {clean_body}\n\n"
+                else:
+                    # Multiple comments - format as conversation in code block
+                    feedback_md += "```\n"
+                    for i, comment in enumerate(thread_comments):
+                        author = comment['author']
+                        body = comment['body']
 
-                feedback_md += "\n"
+                        # Clean up extra newlines - collapse multiple blank lines to single blank line
+                        clean_body = re.sub(r'\n\n+', '\n\n', body).strip()
+
+                        # Format with author and arrow
+                        feedback_md += f"- {author} → "
+
+                        # Check if body is multi-line
+                        if '\n' in clean_body:
+                            # Multi-line: put content on next line with indentation
+                            feedback_md += "\n\n"
+                            # Indent all lines, but don't add spaces to blank lines
+                            lines = clean_body.split('\n')
+                            indented_lines = []
+                            for line in lines:
+                                if line.strip():  # Non-blank line
+                                    indented_lines.append('    ' + line)
+                                else:  # Blank line
+                                    indented_lines.append('')
+                            indented_body = '\n'.join(indented_lines)
+                            feedback_md += indented_body
+                        else:
+                            # Single line: keep on same line
+                            feedback_md += clean_body
+
+                        # Add spacing between comments
+                        if i < len(thread_comments) - 1:
+                            feedback_md += "\n\n"
+
+                    feedback_md += "\n```\n\n"
+
         else:
             feedback_md += "No comments found.\n"
 
