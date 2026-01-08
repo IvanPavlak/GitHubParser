@@ -249,7 +249,38 @@ class GitHubPRParser:
         """
         filepath = file_data['filename']
         extension = self.get_file_extension(filepath)
+        status = file_data.get('status', '')
         patch = file_data.get('patch', '')
+
+        # Check if file was deleted
+        if status == 'removed':
+            output = f"### `{filepath}`\n\n"
+            output += f"```{extension}\n"
+            output += "// Old\n...\n"
+
+            # Extract the old code from the patch
+            if patch:
+                patch_normalized = patch.replace('\r\n', '\n').replace('\r', '\n')
+                lines = patch_normalized.split('\n')
+                old_code = []
+                for line in lines:
+                    if not line:
+                        continue
+                    if line.startswith('@@') or line.startswith('+++') or line.startswith('---'):
+                        continue
+                    # For removed files, all lines are either context (space) or removed (-)
+                    if line and line[0] in [' ', '-']:
+                        old_code.append(line[1:])
+
+                if old_code:
+                    output += '\n'.join(old_code)
+                    output += "\n...\n"
+
+            output += "\n// New\n...\n"
+            output += "FILE REMOVED\n"
+            output += "...\n"
+            output += "```\n\n"
+            return output
 
         if not patch:
             return ''
@@ -320,16 +351,17 @@ class GitHubPRParser:
 
         return output
 
-    def extract_comment_context(self, diff_hunk: str, context_lines: int = 2) -> List[str]:
+    def extract_comment_context(self, diff_hunk: str, context_before: int = 2, context_after: int = 2) -> List[str]:
         """
-        Extract the commented line and N lines of context above it from a diff hunk.
+        Extract the commented line with context lines above and below it from a diff hunk.
 
         Args:
             diff_hunk: The diff hunk containing the commented code
-            context_lines: Number of lines to show above the commented line (default: 2)
+            context_before: Number of lines to show before the commented line (default: 2)
+            context_after: Number of lines to show after the commented line (default: 2)
 
         Returns:
-            List of code lines with context
+            List of code lines with context (up to context_before + 1 + context_after lines)
         """
         if not diff_hunk:
             return []
@@ -352,10 +384,25 @@ class GitHubPRParser:
             else:
                 code_lines.append(line)
 
-        # Return the last N+1 lines (N context lines + 1 commented line)
-        # GitHub comments typically point to the last line in the hunk
-        num_lines = context_lines + 1
-        return code_lines[-num_lines:] if len(code_lines) >= num_lines else code_lines
+        if not code_lines:
+            return []
+
+        # GitHub comments typically point to a specific line in the diff
+        # We'll show context_before + commented line + context_after
+        # For simplicity, we'll extract from the middle of the hunk
+        total_lines = len(code_lines)
+        target_lines = context_before + 1 + context_after
+
+        # If we have fewer lines than needed, return all lines
+        if total_lines <= target_lines:
+            return code_lines
+
+        # Extract a window from the middle-to-end of the diff
+        # (comments are often near the end of what's shown)
+        start_idx = max(0, total_lines - target_lines - 1)
+        end_idx = min(total_lines, start_idx + target_lines)
+
+        return code_lines[start_idx:end_idx]
 
     def format_comments(self, comments: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, str]]]:
         """
@@ -440,8 +487,8 @@ class GitHubPRParser:
                     # Add code snippet if available
                     if comment['code']:
                         extension = self.get_file_extension(filepath)
-                        # Extract the commented line and 2 lines of context above it
-                        context_lines = self.extract_comment_context(comment['code'], context_lines=2)
+                        # Extract the commented line with 2 lines above and 2 lines below
+                        context_lines = self.extract_comment_context(comment['code'], context_before=2, context_after=2)
 
                         if context_lines:
                             feedback_md += f"```{extension}\n"
