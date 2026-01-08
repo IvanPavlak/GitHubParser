@@ -255,6 +255,8 @@ class GitHubPRParser:
             return ''
 
         # Parse the patch to extract old and new code sections
+        # Normalize line endings (handle both \r\n and \n)
+        patch = patch.replace('\r\n', '\n').replace('\r', '\n')
         lines = patch.split('\n')
         old_sections = []
         new_sections = []
@@ -262,6 +264,10 @@ class GitHubPRParser:
         current_new = []
 
         for line in lines:
+            # Skip empty lines that aren't part of the actual code
+            if not line:
+                continue
+
             if line.startswith('@@'):
                 # New hunk, save previous sections if any
                 if current_old or current_new:
@@ -272,13 +278,13 @@ class GitHubPRParser:
                     current_old = []
                     current_new = []
             elif line.startswith('-') and not line.startswith('---'):
-                # Removed line
+                # Removed line - preserve the content after the '-'
                 current_old.append(line[1:])
             elif line.startswith('+') and not line.startswith('+++'):
-                # Added line
+                # Added line - preserve the content after the '+'
                 current_new.append(line[1:])
             elif line.startswith(' '):
-                # Context line
+                # Context line - preserve the content after the space
                 current_old.append(line[1:])
                 current_new.append(line[1:])
 
@@ -295,15 +301,22 @@ class GitHubPRParser:
 
         # If only additions (new file or new code only)
         if not old_sections and new_sections:
-            output += '\n...\n'.join(new_sections)
+            # Join sections with ... separator
+            formatted_sections = []
+            for section in new_sections:
+                formatted_sections.append(section)
+            output += '\n...\n'.join(formatted_sections)
         else:
             # Show old and new sections
-            output += "// Old\n"
-            output += '...\n' + '\n...\n'.join(old_sections) + '\n...\n'
-            output += "\n// New\n"
-            output += '...\n' + '\n...\n'.join(new_sections) + '\n...\n'
+            output += "// Old\n...\n"
+            # Join old sections with ... separator
+            output += '\n...\n'.join(old_sections)
+            output += "\n...\n\n// New\n...\n"
+            # Join new sections with ... separator
+            output += '\n...\n'.join(new_sections)
+            output += "\n..."
 
-        output += "```\n\n"
+        output += "\n```\n\n"
 
         return output
 
