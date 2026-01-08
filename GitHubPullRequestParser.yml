@@ -1,0 +1,11 @@
+name: GitHubPullRequestParser
+channels:
+  - defaults
+dependencies:
+  - python=3.12.1
+  - pip=24.0
+  - setuptools=69.5.1
+  - wheel=0.43.0
+  - pip:
+      - requests==2.31.0
+prefix: C:\Users\Ivan\miniconda3\envs\GitHubPullRequestParser
