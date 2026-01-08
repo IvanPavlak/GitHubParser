@@ -4,8 +4,7 @@ function GitHubPullRequestParser {
 	Set-Location -Path $MachineSpecificPaths.GitHubPullRequestParserDirectory
 
 	try {
-		$batFile = Join-Path (Get-Location) "GitHubPullRequestParser.bat"
-		& cmd /c "`"$batFile`""
+		& ".\GitHubPullRequestParser.bat"
 		Write-Host -ForegroundColor Green "`n=> GitHub Pull Request Parsing Completed!"
 	}
 	catch {
