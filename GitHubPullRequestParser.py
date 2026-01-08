@@ -320,6 +320,43 @@ class GitHubPRParser:
 
         return output
 
+    def extract_comment_context(self, diff_hunk: str, context_lines: int = 2) -> List[str]:
+        """
+        Extract the commented line and N lines of context above it from a diff hunk.
+
+        Args:
+            diff_hunk: The diff hunk containing the commented code
+            context_lines: Number of lines to show above the commented line (default: 2)
+
+        Returns:
+            List of code lines with context
+        """
+        if not diff_hunk:
+            return []
+
+        # Normalize line endings
+        diff_hunk = diff_hunk.replace('\r\n', '\n').replace('\r', '\n')
+        lines = diff_hunk.split('\n')
+
+        # Extract actual code lines (skip @@ headers and file markers)
+        code_lines = []
+        for line in lines:
+            if not line:
+                continue
+            # Skip diff headers
+            if line.startswith('@@') or line.startswith('---') or line.startswith('+++'):
+                continue
+            # Extract the actual code (remove diff prefix: ' ', '+', '-')
+            if line and line[0] in [' ', '+', '-']:
+                code_lines.append(line[1:])
+            else:
+                code_lines.append(line)
+
+        # Return the last N+1 lines (N context lines + 1 commented line)
+        # GitHub comments typically point to the last line in the hunk
+        num_lines = context_lines + 1
+        return code_lines[-num_lines:] if len(code_lines) >= num_lines else code_lines
+
     def format_comments(self, comments: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, str]]]:
         """
         Group and format comments by file.
@@ -403,17 +440,13 @@ class GitHubPRParser:
                     # Add code snippet if available
                     if comment['code']:
                         extension = self.get_file_extension(filepath)
-                        # Extract just the relevant code from diff hunk
-                        code_lines = comment['code'].split('\n')
-                        clean_code = []
-                        for line in code_lines:
-                            if not line.startswith('@@'):
-                                clean_line = line[1:] if line and line[0] in [' ', '+', '-'] else line
-                                clean_code.append(clean_line)
+                        # Extract the commented line and 2 lines of context above it
+                        context_lines = self.extract_comment_context(comment['code'], context_lines=2)
 
-                        feedback_md += f"```{extension}\n"
-                        feedback_md += '\n'.join(clean_code)
-                        feedback_md += "\n```\n\n"
+                        if context_lines:
+                            feedback_md += f"```{extension}\n"
+                            feedback_md += '\n'.join(context_lines)
+                            feedback_md += "\n```\n\n"
 
                     # Add comment
                     feedback_md += f"- `{comment['author']}` → {comment['body']}\n"
