@@ -1,187 +1,386 @@
-# Setup Guide
+# GitHub Pull Request Parser
 
-## Installation
+A Python tool to extract and format GitHub Pull Request information into organized markdown files.
 
-### Method 1: Using Conda Environment (Recommended)
+## Requirements
 
-1. **Install Miniconda/Anaconda** (if not already installed)
-   - Download from: https://docs.conda.io/en/latest/miniconda.html
+- Python 3.12+ (or 3.7+)
+- Miniconda or Anaconda (recommended)
+- Python package: `requests>=2.31.0`
+- GitHub Personal Access Token (for private repositories)
 
-2. **Create the conda environment from the YAML file:**
+## Features
+
+- Parses GitHub PR URLs and extracts all file changes and comments
+- Supports both public and private repositories (with authentication)
+- Filters files using customizable ignore patterns via `PRIgnore.txt` (similar to .gitignore)
+- Categorizes files as Backend, Frontend, or Other
+- Generates separate markdown files for:
+  - **Description.md** - List of all changed files with placeholder descriptions
+  - **Code.md** - All code changes with old/new sections
+  - **Feedback.md** - All PR review comments and conversations
+  - **PRIgnore_Report.txt** - Report showing patterns used and files that were ignored
+- Creates an organized folder on your Desktop: `PR_<number>_<repo_name>`
+- Handles large PRs (tested with 261+ files)
+
+## Quick Start
+
+1. **Create conda environment:**
    ```bash
    conda env create -f GitHubPullRequestParser.yml
    ```
 
-3. **Activate the environment:**
-   ```bash
-   conda activate GitHubPullRequestParser
-   ```
+2. **Set up GitHub authentication** (required for private repos):
 
-4. **Verify installation:**
-   ```bash
-   python --version
-   pip list
-   ```
+   Create a Personal Access Token:
+   - Go to: https://github.com/settings/tokens
+   - Click "Generate new token" → "Generate new token (classic)"
+   - Give it a name (e.g., "PR Parser")
+   - Select scope: `repo` (for private repos) or `public_repo` (for public only)
+   - Click "Generate token" and copy it
 
-### Method 2: Using pip (Alternative)
-
-1. **Install Python** (if not already installed)
-   - Python 3.7 or higher is required
-   - Download from: https://www.python.org/downloads/
-
-2. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-   Or install directly:
-   ```bash
-   pip install requests
-   ```
-
-## GitHub Authentication (Optional but Recommended)
-
-For public repositories, authentication is optional. For private repositories or to avoid rate limits, you need to authenticate.
-
-### Option 1: Environment Variable (Recommended)
-Set the `GITHUB_TOKEN` environment variable with your GitHub Personal Access Token:
-
-**Windows (PowerShell):**
-```powershell
-$env:GITHUB_TOKEN = "your_token_here"
-```
-
-**Windows (Command Prompt):**
-```cmd
-set GITHUB_TOKEN=your_token_here
-```
-
-**Linux/Mac:**
-```bash
-export GITHUB_TOKEN=your_token_here
-```
-
-### Option 2: Pass token directly in code
-You can modify the script to pass the token directly when initializing the parser:
-```python
-parser = GitHubPRParser(token="your_token_here")
-```
-
-### How to Create a GitHub Personal Access Token
-
-1. Go to GitHub Settings → Developer settings → Personal access tokens → Tokens (classic)
-2. Click "Generate new token" → "Generate new token (classic)"
-3. Give it a name (e.g., "PR Parser")
-4. Select scopes:
-   - For public repos: `public_repo`
-   - For private repos: `repo` (full control)
-5. Click "Generate token" and copy it
-
-## Usage
-
-### Method 1: Using Batch File (Windows - Recommended)
-
-If you're using the conda environment, simply run:
-```cmd
-GitHubPullRequestParser.bat
-```
-
-This will automatically activate the conda environment and run the script.
-
-### Method 2: Using PowerShell Function (Windows)
-
-1. **Add to your PowerShell profile** (one-time setup):
-
-   First, ensure you have a `$MachineSpecificPaths` variable in your PowerShell profile with the parser directory:
+   Set as environment variable:
    ```powershell
-   $MachineSpecificPaths = @{
-       GitHubPullRequestParserDirectory = "C:\Users\Ivan\Development\GitHub\GitHubPullRequestParser"
-   }
+   # PowerShell (temporary - current session only)
+   $env:GITHUB_TOKEN = "your_token_here"
+
+   # Or add to your PowerShell profile for permanent setup
+   notepad $PROFILE
+   # Add: $env:GITHUB_TOKEN = "your_token_here"
    ```
 
-2. **Load the function** by dot-sourcing the script:
-   ```powershell
-   . "C:\Users\Ivan\Development\GitHub\GitHubPullRequestParser\GitHubPullRequestParser.ps1"
+   Or set in batch file:
+   ```batch
+   # Edit GitHubPullRequestParser.bat and add before python command:
+   set GITHUB_TOKEN=your_token_here
    ```
 
-3. **Run the parser** from anywhere:
+3. **Configure ignore patterns** (optional):
+
+   Edit `PRIgnore.txt` in the repository to customize which files to ignore:
+   ```bash
+   notepad PRIgnore.txt
+   ```
+
+   Default patterns include migrations, minified files, and dependencies. Add your own patterns as needed.
+
+4. **Run the parser:**
+   ```cmd
+   GitHubPullRequestParser.bat
+   ```
+   Or with PowerShell:
    ```powershell
    GitHubPullRequestParser
    ```
 
-### Method 3: Direct Python Execution
-
-1. Activate the conda environment (if using conda):
-   ```bash
-   conda activate GitHubPullRequestParser
+5. **Enter PR URL when prompted:**
+   ```
+   https://github.com/owner/repo/pull/123
    ```
 
-2. Run the script:
-   ```bash
-   python GitHubPullRequestParser.py
+6. **Find your files on Desktop:**
+   - A folder named `PR_123_owner_repo` will be created
+   - Contains: Description.md, Code.md, Feedback.md, PRIgnore_Report.txt
+
+## Output Structure
+
+```
+Desktop/
+└── PR_3_futurama-soft_asseto/
+    ├── Description.md         # File list with description placeholders
+    ├── Code.md                # All code changes (old/new sections)
+    ├── Feedback.md            # All PR comments and conversations
+    └── PRIgnore_Report.txt    # Report showing patterns used and ignored files
+```
+
+### Example: Description.md
+```markdown
+# Description
+
+## Backend
+
+### `api/src/Api/Artworks/ArtworkEndpointGroup.cs`
+
+- Description
+
+## Frontend
+
+### `ui/src/api/auth.ts`
+
+- Description
+```
+
+### Example: Code.md
+Shows all code changes with old/new sections for easy comparison:
+```markdown
+# Code
+
+## Backend
+
+### `api/src/Api/Artworks/ArtworkEndpointGroup.cs`
+
+```cs
+// Old
+...
+protected override void MapCustomEndpoints(RouteGroupBuilder group)
+{
+    base.MapCustomEndpoints(group);
+}
+...
+
+// New
+...
+protected override void MapGridPropertiesEndpoint(RouteGroupBuilder group)
+{
+    base.MapGridPropertiesEndpoint(group);
+    // ... new implementation
+}
+...
+```
+```
+
+### Example: Feedback.md
+Contains all PR review comments with relevant code snippets:
+```markdown
+# Feedback
+
+### `api/src/Api/Artworks/ArtworkEndpointGroup.cs`
+
+```cs
+protected override void MapCreatePropertiesEndpoint(RouteGroupBuilder group)
+{
+    base.MapCreatePropertiesEndpoint(group);
+```
+
+- `ReviewerUsername` → Some comment about the implementation
+- `AuthorUsername` → Reply to the comment
+```
+
+### Example: PRIgnore_Report.txt
+Report generated during processing showing patterns used and files that were skipped:
+```
+# PRIgnore Report
+# This report shows which files were ignored during PR parsing
+
+## Ignore Patterns Used
+# Loaded from: PRIgnore.txt in repository
+# Total patterns: 7
+
+**/Migrations/*
+**/migrations/*
+**/*.min.js
+**/*.min.css
+**/node_modules/*
+**/package-lock.json
+**/yarn.lock
+
+## Ignored Files
+# Total files ignored: 15
+
+api/src/Domain/Database/Migrations/20251107094120_initial-migration.cs
+ui/package-lock.json
+...
+```
+
+## Installation
+
+### Method 1: Using Conda (Recommended)
+
+This creates an isolated environment with Python 3.12 and all dependencies.
+
+```bash
+# Create environment from YAML file
+conda env create -f GitHubPullRequestParser.yml
+
+# Activate environment
+conda activate GitHubPullRequestParser
+
+# Verify installation
+python --version
+# Should show: Python 3.12.1
+```
+
+The `GitHubPullRequestParser.yml` file includes:
+- Python 3.12.1
+- pip 24.0
+- requests 2.31.0
+
+### Method 2: Using pip (Alternative)
+
+If you prefer not to use Conda:
+
+```bash
+# Make sure you have Python 3.7+ installed
+python --version
+
+# Install the required package
+pip install requests>=2.31.0
+```
+
+## Usage Methods
+
+### 1. Batch File (Windows - Easiest)
+
+Simply double-click or run from command line:
+```cmd
+GitHubPullRequestParser.bat
+```
+
+This automatically:
+- Activates the conda environment
+- Runs the Python script
+- Prompts you for PR URL and ignore patterns
+
+### 2. PowerShell Function (For Power Users)
+
+Set up once in your PowerShell profile for easy access from anywhere:
+
+1. Open your PowerShell profile:
+   ```powershell
+   notepad $PROFILE
    ```
 
-3. Enter the PR URL when prompted:
+2. Add these lines:
+   ```powershell
+   # Add path to machine-specific paths
+   $MachineSpecificPaths = @{
+       GitHubPullRequestParserDirectory = "C:\Users\Ivan\Development\GitHub\GitHubPullRequestParser"
+   }
+
+   # Load the function
+   . "C:\Users\Ivan\Development\GitHub\GitHubPullRequestParser\GitHubPullRequestParser.ps1"
    ```
-   Enter GitHub PR URL: https://github.com/futurama-soft/asseto/pull/3
+
+3. Save and reload your profile:
+   ```powershell
+   . $PROFILE
    ```
 
-4. Optionally add custom ignore patterns (comma-separated):
+4. Now you can run from anywhere:
+   ```powershell
+   GitHubPullRequestParser
    ```
-   Enter custom ignore patterns: **/test/*, **/*.min.js
-   ```
 
-5. The script will generate a markdown file on your Desktop with the name `pr_<number>_review.md`
+### 3. Direct Python Execution
 
-### Programmatic Usage
+For direct control or scripting:
 
-You can also use the parser in your own Python scripts:
+```bash
+# Activate environment (if using conda)
+conda activate GitHubPullRequestParser
 
+# Run the script
+python GitHubPullRequestParser.py
+```
+
+Or use programmatically in your own Python scripts:
 ```python
 from GitHubPullRequestParser import GitHubPRParser
 
-# Initialize parser
 parser = GitHubPRParser()
-
-# Add custom ignore patterns
-parser.add_ignore_patterns(['**/test/*', '**/*.min.js'])
-
-# Parse PR
+parser.add_ignore_patterns(['**/test/*'])
 parser.parse('https://github.com/owner/repo/pull/123')
 ```
 
-## Default Ignore Patterns
+## Configuring Ignore Patterns
 
-The script comes with default ignore patterns similar to `.gitignore`:
+The parser reads ignore patterns from `PRIgnore.txt` in the repository (similar to `.gitignore`).
 
-- `**/Migrations/*` - Database migration files
+### Default Patterns Included
+
+The `PRIgnore.txt` file comes pre-configured with sensible defaults:
+
+- `**/Migrations/*` - Database migrations
 - `**/migrations/*` - Migration files (lowercase)
 - `**/*.min.js` - Minified JavaScript
 - `**/*.min.css` - Minified CSS
-- `**/node_modules/*` - Node.js dependencies
-- `**/package-lock.json` - Package lock files
+- `**/node_modules/*` - Node dependencies
+- `**/package-lock.json` - Lock files
 - `**/yarn.lock` - Yarn lock files
 
-## Output Format
+### Adding Custom Patterns
 
-The generated markdown file contains three main sections:
+Edit `PRIgnore.txt` to add your own patterns. Use wildcard syntax:
 
-1. **Description** - List of all files with placeholder for manual descriptions
-2. **Code** - Actual code changes with old/new sections
-3. **Feedback** - PR review comments and conversations
+```bash
+# Open PRIgnore.txt in your editor
+notepad PRIgnore.txt
+```
 
-Files are automatically categorized as:
-- **Backend** - Files in `api/` folder or with extensions: `.cs`, `.java`, `.py`, `.go`
-- **Frontend** - Files in `ui/`/`frontend/` folders or with extensions: `.ts`, `.tsx`, `.jsx`, `.vue`
-- **Other** - Everything else
+**Examples of custom patterns:**
+- `**/test/*` - Ignore all test directories
+- `**/*.spec.ts` - Ignore all spec files
+- `**/dist/*` - Ignore distribution folders
+- `**/build/*` - Ignore build folders
+- `specific/path/file.txt` - Ignore a specific file
+
+**Comments:** Lines starting with `#` are treated as comments and ignored.
+
+**Report:** After processing, check `PRIgnore_Report.txt` in the output folder to see what was ignored.
+
+## File Categorization
+
+Files are automatically categorized into sections:
+
+- **Backend**: Files in `api/` folder or with extensions `.cs`, `.java`, `.py`, `.go`
+- **Frontend**: Files in `ui/`/`frontend/` folders or with extensions `.ts`, `.tsx`, `.jsx`, `.vue`
+- **Other**: Everything else (configs, docs, etc.)
+
+This makes it easier to review changes by technology stack.
 
 ## Troubleshooting
 
+### 404 Error - Not Found
+**Problem**: `404 Client Error: Not Found for url`
+
+**Solutions**:
+1. Repository is private - Set `GITHUB_TOKEN` environment variable
+2. Check if the PR URL is correct
+3. Verify you have access to the repository
+4. Make sure the PR number exists
+
 ### Rate Limit Errors
-If you get rate limit errors, authenticate with a GitHub token (see Authentication section above).
+**Problem**: GitHub API rate limit exceeded
 
-### Permission Errors
-Make sure you have access to the repository (for private repos) and that your token has the correct scopes.
+**Solution**: Authenticate with a GitHub token to increase limits from 60/hour to 5000/hour
 
-### Desktop Path Not Found
-The script saves to `~/Desktop` (or `%USERPROFILE%\Desktop` on Windows). If your Desktop is in a different location, you can modify the `save_to_desktop` method in the script.
+### Authentication Not Working
+**Problem**: Token set but still getting 404
+
+**Solutions**:
+1. Verify token has correct scope (`repo` for private, `public_repo` for public)
+2. Restart your terminal/PowerShell after setting environment variable
+3. Check token hasn't expired
+4. Try setting token directly in the batch file
+
+### Missing Files in Output
+**Problem**: Some files not appearing in generated markdown
+
+**Solution**:
+1. Check `PRIgnore_Report.txt` in the output folder to see if files were ignored and why
+2. Edit `PRIgnore.txt` in the repository to remove unwanted patterns
+3. Re-run the parser
+
+### Large PR Performance
+**Problem**: Script is slow with 200+ files
+
+**Note**: This is expected. The script fetches all data from GitHub API, which can take time for large PRs. Be patient - all 261 files will be processed.
+
+## Project Structure
+
+```
+GitHubPullRequestParser/
+├── GitHubPullRequestParser.py       # Main Python script
+├── GitHubPullRequestParser.yml      # Conda environment file
+├── GitHubPullRequestParser.bat      # Windows batch launcher
+├── GitHubPullRequestParser.ps1      # PowerShell function
+├── PRIgnore.txt                     # Ignore patterns configuration
+└── README.md                        # Complete documentation
+```
+
+**Configuration File:**
+- **PRIgnore.txt**: Edit this file to customize which files to ignore during PR parsing. Uses wildcard patterns similar to .gitignore.
+
+## Support
+
+For issues, questions, or contributions, please refer to the GitHub repository.

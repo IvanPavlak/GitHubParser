@@ -1,0 +1,38 @@
+# PRIgnore.txt - Patterns for files to ignore when parsing Pull Requests
+# Similar to .gitignore, one pattern per line
+# Supports wildcard matching using glob patterns
+#
+# Examples:
+#   **/Migrations/*           - Ignore all files in any Migrations folder
+#   **/*.min.js               - Ignore all minified JavaScript files
+#   **/test/*                 - Ignore all test directories
+#   **/dist/*                 - Ignore distribution folders
+#   specific/path/file.txt    - Ignore a specific file
+#
+# Lines starting with # are comments and will be ignored
+
+# Database Migrations
+**/Migrations/*
+**/migrations/*
+
+# Minified Files
+**/*.min.js
+**/*.min.css
+
+# Dependencies
+**/node_modules/*
+**/package-lock.json
+**/yarn.lock
+
+# Build Artifacts
+# **/dist/*
+# **/build/*
+
+# Test Files
+# **/test/*
+# **/*.test.js
+# **/*.spec.ts
+
+# Documentation (uncomment if you want to ignore)
+# **/*.md
+# **/docs/*

@@ -13,12 +13,13 @@ from fnmatch import fnmatch
 
 
 class GitHubPRParser:
-    def __init__(self, token: Optional[str] = None):
+    def __init__(self, token: Optional[str] = None, prignore_path: Optional[str] = None):
         """
         Initialize the parser with optional GitHub token.
 
         Args:
             token: GitHub personal access token. If None, will try to read from GITHUB_TOKEN env var.
+            prignore_path: Path to PRIgnore.txt file. If None, looks in script directory.
         """
         self.token = token or os.getenv('GITHUB_TOKEN')
         self.headers = {
@@ -27,16 +28,44 @@ class GitHubPRParser:
         if self.token:
             self.headers['Authorization'] = f'token {self.token}'
 
-        # Default ignore patterns (similar to gitignore)
-        self.ignore_patterns = [
-            '**/Migrations/*',
-            '**/migrations/*',
-            '**/*.min.js',
-            '**/*.min.css',
-            '**/node_modules/*',
-            '**/package-lock.json',
-            '**/yarn.lock',
-        ]
+        # Load ignore patterns from PRIgnore.txt
+        if prignore_path is None:
+            script_dir = Path(__file__).parent
+            prignore_path = script_dir / 'PRIgnore.txt'
+
+        self.ignore_patterns = self.load_ignore_patterns(prignore_path)
+
+    def load_ignore_patterns(self, prignore_path: Path) -> List[str]:
+        """
+        Load ignore patterns from PRIgnore.txt file.
+
+        Args:
+            prignore_path: Path to PRIgnore.txt file
+
+        Returns:
+            List of ignore patterns
+        """
+        patterns = []
+
+        if not prignore_path.exists():
+            print(f"Warning: PRIgnore.txt not found at {prignore_path}")
+            print("Using empty ignore list. Create PRIgnore.txt to configure ignore patterns.")
+            return patterns
+
+        try:
+            with open(prignore_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    # Skip empty lines and comments
+                    if line and not line.startswith('#'):
+                        patterns.append(line)
+
+            print(f"Loaded {len(patterns)} ignore pattern(s) from PRIgnore.txt")
+        except Exception as e:
+            print(f"Error reading PRIgnore.txt: {e}")
+            print("Continuing with empty ignore list.")
+
+        return patterns
 
     def parse_pr_url(self, url: str) -> tuple:
         """
@@ -114,9 +143,44 @@ class GitHubPRParser:
         ext = os.path.splitext(filepath)[1]
         return ext_map.get(ext, '')
 
+    def fetch_paginated(self, url: str, resource_name: str) -> List[Dict[str, Any]]:
+        """
+        Fetch all pages of a paginated GitHub API endpoint.
+
+        Args:
+            url: The API endpoint URL
+            resource_name: Name of the resource (for progress messages)
+
+        Returns:
+            List of all items from all pages
+        """
+        all_items = []
+        page = 1
+        per_page = 100  # Maximum allowed by GitHub API
+
+        while True:
+            params = {'per_page': per_page, 'page': page}
+            response = requests.get(url, headers=self.headers, params=params)
+            response.raise_for_status()
+
+            items = response.json()
+            if not items:  # No more items
+                break
+
+            all_items.extend(items)
+            print(f"  Fetched page {page} ({len(items)} {resource_name}, total: {len(all_items)})")
+
+            # Check if there are more pages
+            if len(items) < per_page:
+                break
+
+            page += 1
+
+        return all_items
+
     def fetch_pr_data(self, owner: str, repo: str, pr_number: str) -> Dict[str, Any]:
         """
-        Fetch PR data from GitHub API.
+        Fetch PR data from GitHub API with pagination support.
 
         Args:
             owner: Repository owner
@@ -157,17 +221,15 @@ class GitHubPRParser:
         pr_response.raise_for_status()
         pr_data = pr_response.json()
 
-        # Fetch files changed
+        # Fetch files changed (with pagination)
+        print("\nFetching changed files...")
         files_url = f'{base_url}/files'
-        files_response = requests.get(files_url, headers=self.headers)
-        files_response.raise_for_status()
-        files_data = files_response.json()
+        files_data = self.fetch_paginated(files_url, 'files')
 
-        # Fetch review comments
+        # Fetch review comments (with pagination)
+        print("\nFetching review comments...")
         comments_url = f'{base_url}/comments'
-        comments_response = requests.get(comments_url, headers=self.headers)
-        comments_response.raise_for_status()
-        comments_data = comments_response.json()
+        comments_data = self.fetch_paginated(comments_url, 'comments')
 
         return {
             'pr': pr_data,
@@ -272,17 +334,19 @@ class GitHubPRParser:
 
         return comments_by_file
 
-    def generate_markdown(self, pr_data: Dict[str, Any]) -> str:
+    def generate_markdown_sections(self, pr_data: Dict[str, Any]) -> Dict[str, str]:
         """
-        Generate the final markdown output.
+        Generate separate markdown sections.
 
         Args:
             pr_data: Complete PR data including files and comments
 
         Returns:
-            Formatted markdown string
+            Dictionary with 'description', 'code', and 'feedback' markdown sections
         """
-        files = [f for f in pr_data['files'] if not self.should_ignore(f['filename'])]
+        all_files = pr_data['files']
+        files = [f for f in all_files if not self.should_ignore(f['filename'])]
+        ignored_files = [f['filename'] for f in all_files if self.should_ignore(f['filename'])]
         comments = pr_data['comments']
 
         # Group files by category
@@ -293,37 +357,34 @@ class GitHubPRParser:
                 files_by_category[category] = []
             files_by_category[category].append(file_data)
 
-        # Start building markdown
-        md = "# Description\n\n"
+        # === Description Section ===
+        description_md = "# Description\n\n"
 
-        # Description section with file headers
         for category in sorted(files_by_category.keys()):
-            md += f"## {category}\n\n"
+            description_md += f"## {category}\n\n"
             for file_data in files_by_category[category]:
                 filepath = file_data['filename']
-                md += f"### `{filepath}`\n\n"
-                md += "- Description\n"
-            md += "\n"
+                description_md += f"### `{filepath}`\n\n"
+                description_md += "- Description\n\n"
 
-        md += "___\n# Code\n\n"
+        # === Code Section ===
+        code_md = "# Code\n\n"
 
-        # Code section with changes
         for category in sorted(files_by_category.keys()):
-            md += f"## {category}\n\n"
+            code_md += f"## {category}\n\n"
             for file_data in files_by_category[category]:
-                md += self.format_code_changes(file_data)
+                code_md += self.format_code_changes(file_data)
 
-        # Feedback section with comments
+        # === Feedback Section ===
+        feedback_md = "# Feedback\n\n"
         comments_by_file = self.format_comments(comments)
 
         if comments_by_file:
-            md += "___\n# Feedback\n\n"
-
             for filepath, file_comments in comments_by_file.items():
                 if self.should_ignore(filepath):
                     continue
 
-                md += f"### `{filepath}`\n\n"
+                feedback_md += f"### `{filepath}`\n\n"
 
                 for comment in file_comments:
                     # Add code snippet if available
@@ -337,42 +398,88 @@ class GitHubPRParser:
                                 clean_line = line[1:] if line and line[0] in [' ', '+', '-'] else line
                                 clean_code.append(clean_line)
 
-                        md += f"```{extension}\n"
-                        md += '\n'.join(clean_code)
-                        md += "\n```\n\n"
+                        feedback_md += f"```{extension}\n"
+                        feedback_md += '\n'.join(clean_code)
+                        feedback_md += "\n```\n\n"
 
                     # Add comment
-                    md += f"- `{comment['author']}` → {comment['body']}\n"
+                    feedback_md += f"- `{comment['author']}` → {comment['body']}\n"
 
-                md += "\n"
+                feedback_md += "\n"
+        else:
+            feedback_md += "No comments found.\n"
 
-        md += "___\n"
+        return {
+            'description': description_md,
+            'code': code_md,
+            'feedback': feedback_md,
+            'ignored_files': ignored_files
+        }
 
-        return md
-
-    def save_to_desktop(self, content: str, filename: str = 'pr_review.md'):
+    def save_pr_sections(self, sections: Dict[str, str], pr_number: str, repo_name: str):
         """
-        Save content to a file on the desktop.
+        Save PR sections to separate files in a folder on the desktop.
 
         Args:
-            content: Content to save
-            filename: Name of the file
+            sections: Dictionary containing markdown sections and ignored files
+            pr_number: PR number
+            repo_name: Repository name
         """
         desktop = Path.home() / 'Desktop'
-        filepath = desktop / filename
+        folder_name = f"PR_{pr_number}_{repo_name.replace('/', '_')}"
+        pr_folder = desktop / folder_name
 
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(content)
+        # Create folder
+        pr_folder.mkdir(exist_ok=True)
+        print(f"\nCreating PR folder: {pr_folder}")
 
-        print(f"\nMarkdown file saved to: {filepath}")
+        # Save Description.md
+        desc_file = pr_folder / 'Description.md'
+        with open(desc_file, 'w', encoding='utf-8') as f:
+            f.write(sections['description'])
+        print(f"  ✓ Saved: Description.md")
 
-    def parse(self, pr_url: str, output_filename: Optional[str] = None):
+        # Save Code.md
+        code_file = pr_folder / 'Code.md'
+        with open(code_file, 'w', encoding='utf-8') as f:
+            f.write(sections['code'])
+        print(f"  ✓ Saved: Code.md")
+
+        # Save Feedback.md
+        feedback_file = pr_folder / 'Feedback.md'
+        with open(feedback_file, 'w', encoding='utf-8') as f:
+            f.write(sections['feedback'])
+        print(f"  ✓ Saved: Feedback.md")
+
+        # Save PRIgnore_Report.txt
+        prignore_report_file = pr_folder / 'PRIgnore_Report.txt'
+        with open(prignore_report_file, 'w', encoding='utf-8') as f:
+            f.write("# PRIgnore Report\n")
+            f.write("# This report shows which files were ignored during PR parsing\n\n")
+
+            f.write("## Ignore Patterns Used\n")
+            f.write(f"# Loaded from: PRIgnore.txt in repository\n")
+            f.write(f"# Total patterns: {len(self.ignore_patterns)}\n\n")
+            for pattern in self.ignore_patterns:
+                f.write(f"{pattern}\n")
+
+            f.write("\n## Ignored Files\n")
+            f.write(f"# Total files ignored: {len(sections['ignored_files'])}\n\n")
+            if sections['ignored_files']:
+                for ignored_file in sorted(sections['ignored_files']):
+                    f.write(f"{ignored_file}\n")
+            else:
+                f.write("(No files were ignored)\n")
+        print(f"  ✓ Saved: PRIgnore_Report.txt ({len(sections['ignored_files'])} files ignored)")
+
+        print(f"\n✓ All files saved to: {pr_folder}")
+
+    def parse(self, pr_url: str):
         """
-        Main method to parse a PR and generate markdown.
+        Main method to parse a PR and generate markdown sections.
 
         Args:
             pr_url: GitHub PR URL
-            output_filename: Optional output filename (default: pr_review.md)
         """
         try:
             # Parse URL
@@ -381,18 +488,23 @@ class GitHubPRParser:
 
             # Fetch data
             pr_data = self.fetch_pr_data(owner, repo, pr_number)
-            print(f"Found {len(pr_data['files'])} files and {len(pr_data['comments'])} comments")
+            total_files = len(pr_data['files'])
+            total_comments = len(pr_data['comments'])
+            print(f"Found {total_files} files and {total_comments} comments")
 
-            # Generate markdown
-            markdown = self.generate_markdown(pr_data)
+            # Generate markdown sections
+            print("Generating markdown sections...")
+            sections = self.generate_markdown_sections(pr_data)
 
-            # Save to desktop
-            if output_filename is None:
-                output_filename = f"pr_{pr_number}_review.md"
+            # Count processed files
+            processed_files = total_files - len(sections['ignored_files'])
+            print(f"Processing {processed_files} files ({len(sections['ignored_files'])} ignored)")
 
-            self.save_to_desktop(markdown, output_filename)
+            # Save to desktop in separate files
+            repo_name = f"{owner}_{repo}"
+            self.save_pr_sections(sections, pr_number, repo_name)
 
-            print("✓ Done!")
+            print("\n✓ Done!")
 
         except Exception as e:
             print(f"Error: {e}")
@@ -406,36 +518,33 @@ def main():
     print("=" * 60)
     print()
 
-    # Get PR URL from user
-    pr_url = input("Enter GitHub PR URL: ").strip()
-
-    if not pr_url:
-        print("Error: No URL provided")
-        return
-
-    # Ask about custom ignore patterns
-    custom_ignores = input("\nEnter custom ignore patterns (comma-separated, or press Enter to skip): ").strip()
-
-    # Initialize parser
+    # Initialize parser (loads PRIgnore.txt)
     parser = GitHubPRParser()
 
     # Show authentication status
+    print()
     if parser.token:
         print("✓ Authenticated with GitHub token")
     else:
         print("⚠ Not authenticated - only public repositories accessible")
         print("  Set GITHUB_TOKEN environment variable for private repos")
 
-    # Add custom ignore patterns if provided
-    if custom_ignores:
-        patterns = [p.strip() for p in custom_ignores.split(',')]
-        parser.add_ignore_patterns(patterns)
-        print(f"Added {len(patterns)} custom ignore pattern(s)")
-
-    print(f"\nUsing ignore patterns:")
-    for pattern in parser.ignore_patterns:
-        print(f"  - {pattern}")
+    # Show loaded ignore patterns
+    if parser.ignore_patterns:
+        print(f"\nIgnore patterns loaded from PRIgnore.txt ({len(parser.ignore_patterns)} patterns):")
+        for pattern in parser.ignore_patterns:
+            print(f"  - {pattern}")
+    else:
+        print("\n⚠ No ignore patterns loaded (PRIgnore.txt is empty or not found)")
+        print("  Edit PRIgnore.txt in the repository to configure ignore patterns")
     print()
+
+    # Get PR URL from user
+    pr_url = input("Enter GitHub PR URL: ").strip()
+
+    if not pr_url:
+        print("Error: No URL provided")
+        return
 
     # Parse the PR
     parser.parse(pr_url)
