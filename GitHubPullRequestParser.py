@@ -6,6 +6,7 @@ Extracts PR information and formats it into a structured markdown file.
 
 import os
 import re
+import getpass
 import requests
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -686,16 +687,35 @@ def main():
     print("=" * 60)
     print()
 
-    # Initialize parser (loads PRIgnore.txt)
-    parser = GitHubPRParser()
+    # Check if token exists in environment
+    env_token = os.getenv('GITHUB_TOKEN')
+    token = env_token
+
+    # Ask if the repository is private
+    is_private = input("Is this a private repository? (y/n): ").strip().lower()
+
+    if is_private in ['y', 'yes']:
+        if env_token:
+            print("\n✓ Using GitHub token from GITHUB_TOKEN environment variable")
+        else:
+            print("\nA GitHub personal access token is required for private repositories.")
+            print("Create one at: https://github.com/settings/tokens")
+            print("Required scope: 'repo' (Full control of private repositories)")
+            token = getpass.getpass("\nEnter your GitHub token: ").strip()
+            if not token:
+                print("Error: No token provided. Cannot access private repository.")
+                return
+            print("✓ Token provided")
+
+    # Initialize parser with token (loads PRIgnore.txt)
+    parser = GitHubPRParser(token=token)
 
     # Show authentication status
     print()
     if parser.token:
         print("✓ Authenticated with GitHub token")
     else:
-        print("⚠ Not authenticated - only public repositories accessible")
-        print("  Set GITHUB_TOKEN environment variable for private repos")
+        print("ℹ Not authenticated - accessing public repository")
 
     # Show loaded ignore patterns
     if parser.ignore_patterns:
