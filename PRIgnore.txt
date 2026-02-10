@@ -47,3 +47,6 @@ CHANGELOG.md
 
 # Frontend Types
 **/src/types.ts
+
+# Docs
+**.xml
