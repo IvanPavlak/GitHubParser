@@ -352,17 +352,78 @@ class GitHubPRParser:
 
         return output
 
-    def extract_comment_context(self, diff_hunk: str, context_before: int = 2, context_after: int = 2) -> List[str]:
+    def _get_lines_after_comment(self, full_patch: str, comment_line: int, count: int) -> List[str]:
         """
-        Extract the commented line with context lines above and below it from a diff hunk.
+        Extract lines after the comment line from the full file patch.
+
+        Args:
+            full_patch: The complete file patch
+            comment_line: The line number in the new file where the comment was placed
+            count: Number of lines to extract after the comment
+
+        Returns:
+            List of code lines after the comment
+        """
+        if not full_patch:
+            return []
+
+        full_patch = full_patch.replace('\r\n', '\n').replace('\r', '\n')
+        lines = full_patch.split('\n')
+
+        # Build a list of (new_line_number, code_text) from the full patch
+        new_line_map = []
+        current_new_line = 0
+
+        for line in lines:
+            if not line:
+                continue
+            if line.startswith('@@'):
+                match = re.match(r'@@\s+-\d+(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@', line)
+                if match:
+                    current_new_line = int(match.group(1))
+                continue
+            if line.startswith('---') or line.startswith('+++'):
+                continue
+            if line.startswith('-'):
+                # Removed line, doesn't appear in new file
+                continue
+            if line.startswith('+') or line.startswith(' '):
+                new_line_map.append((current_new_line, line[1:]))
+                current_new_line += 1
+
+        # Find lines after comment_line
+        after_lines = []
+        found = False
+        for line_num, code in new_line_map:
+            if found:
+                after_lines.append(code)
+                if len(after_lines) >= count:
+                    break
+            if line_num == comment_line:
+                found = True
+
+        return after_lines
+
+    def extract_comment_context(self, diff_hunk: str, context_before: int = 2, context_after: int = 2,
+                                full_patch: str = None, comment_line: int = None) -> List[str]:
+        """
+        Extract the commented line with context from a diff hunk.
+
+        GitHub's diff_hunk always ends at the line the comment was placed on.
+        We extract lines as they appear in the new version of the file
+        (context ' ' and added '+' lines, skipping removed '-' lines)
+        and return the last (context_before + 1) lines plus context_after
+        lines from the full file patch.
 
         Args:
             diff_hunk: The diff hunk containing the commented code
-            context_before: Number of lines to show before the commented line (default: 2)
-            context_after: Number of lines to show after the commented line (default: 2)
+            context_before: Number of context lines to show before the commented line (default: 2)
+            context_after: Number of context lines to show after the commented line (default: 2)
+            full_patch: The complete file patch, used to extract lines after the comment
+            comment_line: The line number in the new file where the comment was placed
 
         Returns:
-            List of code lines with context (up to context_before + 1 + context_after lines)
+            List of code lines representing the new version with context
         """
         if not diff_hunk:
             return []
@@ -371,39 +432,35 @@ class GitHubPRParser:
         diff_hunk = diff_hunk.replace('\r\n', '\n').replace('\r', '\n')
         lines = diff_hunk.split('\n')
 
-        # Extract actual code lines (skip @@ headers and file markers)
-        code_lines = []
+        # Extract lines as they appear in the new version of the file.
+        # Context lines (' ') and added lines ('+') represent the new file.
+        # Removed lines ('-') are from the old file and should be excluded
+        # since the reviewer is commenting on the new code.
+        new_code_lines = []
         for line in lines:
             if not line:
                 continue
             # Skip diff headers
             if line.startswith('@@') or line.startswith('---') or line.startswith('+++'):
                 continue
-            # Extract the actual code (remove diff prefix: ' ', '+', '-')
-            if line and line[0] in [' ', '+', '-']:
-                code_lines.append(line[1:])
-            else:
-                code_lines.append(line)
+            # Include context lines and added lines (new version)
+            if line.startswith(' ') or line.startswith('+'):
+                new_code_lines.append(line[1:])
 
-        if not code_lines:
+        if not new_code_lines:
             return []
 
-        # GitHub comments typically point to a specific line in the diff
-        # We'll show context_before + commented line + context_after
-        # For simplicity, we'll extract from the middle of the hunk
-        total_lines = len(code_lines)
-        target_lines = context_before + 1 + context_after
+        # The commented line is the last line in the hunk.
+        # Show context_before lines above it + the commented line itself.
+        start_idx = max(0, len(new_code_lines) - (context_before + 1))
+        result = new_code_lines[start_idx:]
 
-        # If we have fewer lines than needed, return all lines
-        if total_lines <= target_lines:
-            return code_lines
+        # Extract context_after lines from the full file patch
+        if context_after > 0 and full_patch and comment_line:
+            after_lines = self._get_lines_after_comment(full_patch, comment_line, context_after)
+            result.extend(after_lines)
 
-        # Extract a window from the middle-to-end of the diff
-        # (comments are often near the end of what's shown)
-        start_idx = max(0, total_lines - target_lines - 1)
-        end_idx = min(total_lines, start_idx + target_lines)
-
-        return code_lines[start_idx:end_idx]
+        return result
 
     def format_comments(self, comments: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, str]]]:
         """
@@ -449,6 +506,7 @@ class GitHubPRParser:
         all_files = pr_data['files']
         files = [f for f in all_files if not self.should_ignore(f['filename'])]
         ignored_files = [f['filename'] for f in all_files if self.should_ignore(f['filename'])]
+        file_patches = {f['filename']: f.get('patch', '') for f in all_files}
         comments = pr_data['comments']
 
         # Group files by category
@@ -524,7 +582,14 @@ class GitHubPRParser:
                 first_comment = thread_comments[0]
                 if first_comment['code']:
                     extension = self.get_file_extension(filepath)
-                    context_lines = self.extract_comment_context(first_comment['code'], context_before=2, context_after=2)
+                    comment_line = first_comment.get('line', 0) or 0
+                    context_lines = self.extract_comment_context(
+                        first_comment['code'],
+                        context_before=2,
+                        context_after=2,
+                        full_patch=file_patches.get(filepath, ''),
+                        comment_line=comment_line
+                    )
 
                     if context_lines:
                         feedback_md += f"```{extension}\n"
