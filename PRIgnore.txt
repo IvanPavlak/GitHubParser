@@ -39,7 +39,7 @@
 CHANGELOG.md
 # **/docs/*
 
-# Translations
+# Translations and appsettings
 **/*.json
 
 # Project files
