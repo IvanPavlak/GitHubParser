@@ -1,7 +1,5 @@
 # GitHub Pull Request Parser
 
-GitHub Pull Request Parser is a Python CLI tool that fetches a GitHub pull request and creates structured markdown output for note taking in your favourite note app (I use Obsidian btw).
-
 ## Highlights
 
 - Works with public and private repositories
@@ -28,8 +26,7 @@ conda activate GitHubPullRequestParser
 
 Note:
 
-- `GitHubPullRequestParser.yml` currently contains a machine-specific prefix.
-- If env creation fails on your machine, remove the prefix line and retry.
+- `GitHubPullRequestParser.yml` is portable and does not include a machine-specific prefix.
 
 ### pip
 
@@ -88,8 +85,22 @@ This repository also includes:
 
 Important:
 
-- Both currently use machine-specific hardcoded paths.
-- Update these paths before using them on another machine.
+- `GitHubPullRequestParser.bat` reads machine-specific values from `GitHubPullRequestParser.config.bat`.
+- Update `GitHubPullRequestParser.config.bat` before first use.
+
+### Launcher config
+
+`GitHubPullRequestParser.config.bat` contains these editable values:
+
+- `conda_prefix`: full path to your conda environment, for example `C:\\Users\\your-user\\miniconda3\\envs\\GitHubPullRequestParser`
+- `conda_base`: full path to your conda installation, for example `C:\\Users\\your-user\\miniconda3`
+- `python_script`: full path to `GitHubPullRequestParser.py` on your machine
+
+The batch launcher uses this config file to:
+
+- call `%conda_base%\\Scripts\\activate.bat` `%conda_base%`
+- run `conda activate %conda_prefix%`
+- execute `python %python_script%`
 
 ## Output
 
