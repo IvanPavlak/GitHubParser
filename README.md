@@ -190,16 +190,16 @@ Unauthenticated GitHub API usage is limited. Set `GITHUB_TOKEN` to increase limi
 - `GitHubPullRequestParser.py`: main parser
 - `PRIgnore.txt`: ignore rules
 - `SeparateExtractionList.txt`: rules for extra extracted markdown files
-- `LICENSE`: Unlicense (public-domain dedication)
+- `LICENSE`: MIT License
 - `GitHubPullRequestParser.yml`: conda environment spec
 - `GitHubPullRequestParser.bat`: batch launcher (path-dependent)
 - `GitHubPullRequestParser.ps1`: PowerShell wrapper (path-dependent)
 
 ## License
 
-This project is released under the [Unlicense](https://unlicense.org), which is a public-domain dedication.
+This project is released under the MIT License.
 
-In practical terms: you can copy, modify, use, publish, and reuse this code (including commercially) with no attribution requirement.
+In practical terms: you can copy, modify, use, publish, and reuse this code (including commercially), as long as the license notice is included with substantial portions of the software.
 
 ## Contributing
 
