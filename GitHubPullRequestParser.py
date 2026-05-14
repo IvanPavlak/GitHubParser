@@ -22,7 +22,7 @@ class GitHubPRParser:
         Args:
             token: GitHub personal access token. If None, will try to read from GITHUB_TOKEN env var.
             prignore_path: Path to PRIgnore.txt file. If None, looks in script directory.
-            separate_extraction_list_path: Path to separate_extraction_list.txt file.
+            separate_extraction_list_path: Path to SeparateExtractionList.txt file.
                 If None, looks in script directory.
         """
         self.token = token or os.getenv('GITHUB_TOKEN')
@@ -41,14 +41,14 @@ class GitHubPRParser:
             prignore_path = Path(prignore_path)
 
         if separate_extraction_list_path is None:
-            separate_extraction_list_path = script_dir / 'separate_extraction_list.txt'
+            separate_extraction_list_path = script_dir / 'SeparateExtractionList.txt'
         else:
             separate_extraction_list_path = Path(separate_extraction_list_path)
 
         self.ignore_patterns = self.load_patterns_file(prignore_path, 'PRIgnore.txt')
         self.separate_extraction_patterns = self.load_patterns_file(
             separate_extraction_list_path,
-            'separate_extraction_list.txt'
+            'SeparateExtractionList.txt'
         )
 
     def load_patterns_file(self, patterns_path: Path, list_name: str) -> List[str]:
@@ -80,7 +80,7 @@ class GitHubPRParser:
             print(f"Loaded {len(patterns)} pattern(s) from {list_name}")
         except Exception as e:
             print(f"Error reading {list_name}: {e}")
-            print("Continuing with empty ignore list.")
+            print("Continuing with empty pattern list.")
 
         return patterns
 
@@ -95,13 +95,22 @@ class GitHubPRParser:
         Supports optional negation via leading '!'.
         Last matching pattern wins.
         """
+        normalized_filepath = filepath.replace('\\', '/').lstrip('./')
         matched = False
 
         for pattern in patterns:
             is_negation = pattern.startswith('!')
             actual_pattern = pattern[1:] if is_negation else pattern
 
-            if fnmatch(filepath, actual_pattern):
+            # Normalize slashes so patterns work regardless of separator style.
+            normalized_pattern = actual_pattern.replace('\\', '/').lstrip('./')
+
+            is_match = (
+                fnmatch(filepath, actual_pattern) or
+                fnmatch(normalized_filepath, normalized_pattern)
+            )
+
+            if is_match:
                 matched = not is_negation
 
         return matched
@@ -803,6 +812,7 @@ class GitHubPRParser:
         # Save separately extracted file diffs as markdown files in the PR root folder.
         separate_files = sections.get('separate_extraction_files', [])
         used_output_names = set()
+        generated_extraction_files = []
         for file_data in separate_files:
             filepath = file_data['filename']
             status = file_data.get('status', '')
@@ -824,6 +834,7 @@ class GitHubPRParser:
             used_output_names.add(output_name)
             output_file = pr_folder / output_name
             extracted_md = self.format_code_changes(file_data)
+            generated_extraction_files.append((filepath, output_name))
 
             with open(output_file, 'w', encoding='utf-8') as f:
                 if extracted_md:
@@ -834,9 +845,35 @@ class GitHubPRParser:
                     f.write("No textual patch available from GitHub for this file.\n\n")
                     f.write(f"- Status: `{status}`\n")
 
+        separate_report_file = pr_folder / 'SeparateExtraction_Report.txt'
+        with open(separate_report_file, 'w', encoding='utf-8') as f:
+            f.write("# Separate Extraction Report\n")
+            f.write(
+                "# This report shows which files matched SeparateExtractionList.txt "
+                "and where they were written\n\n"
+            )
+
+            f.write("## Extraction Patterns Used\n")
+            f.write("# Loaded from: SeparateExtractionList.txt in repository\n")
+            f.write(f"# Total patterns: {len(self.separate_extraction_patterns)}\n\n")
+            if self.separate_extraction_patterns:
+                for pattern in self.separate_extraction_patterns:
+                    f.write(f"{pattern}\n")
+            else:
+                f.write("(No patterns configured)\n")
+
+            f.write("\n## Matched Files\n")
+            f.write(f"# Total files matched: {len(generated_extraction_files)}\n\n")
+            if generated_extraction_files:
+                for source_file, output_name in sorted(generated_extraction_files):
+                    f.write(f"{source_file} -> {output_name}\n")
+            else:
+                f.write("(No files matched)\n")
+
         print(
             f"  ✓ Saved: {len(separate_files)} separately extracted markdown diff file(s)"
         )
+        print("  ✓ Saved: SeparateExtraction_Report.txt")
 
         print(f"\n✓ All files saved to: {pr_folder}")
 
@@ -926,14 +963,14 @@ def main():
     # Show loaded separate extraction patterns
     if parser.separate_extraction_patterns:
         print(
-            f"\nSeparate extraction patterns loaded from separate_extraction_list.txt "
+            f"\nSeparate extraction patterns loaded from SeparateExtractionList.txt "
             f"({len(parser.separate_extraction_patterns)} patterns):"
         )
         for pattern in parser.separate_extraction_patterns:
             print(f"  - {pattern}")
     else:
         print("\n⚠ No separate extraction patterns loaded")
-        print("  Edit separate_extraction_list.txt in the repository to configure patterns")
+        print("  Edit SeparateExtractionList.txt in the repository to configure patterns")
     print()
 
     # Get PR URL from user
