@@ -8,19 +8,22 @@ import os
 import re
 import getpass
 import requests
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import List, Dict, Any, Optional
 from fnmatch import fnmatch
 
 
 class GitHubPRParser:
-    def __init__(self, token: Optional[str] = None, prignore_path: Optional[str] = None):
+    def __init__(self, token: Optional[str] = None, prignore_path: Optional[str] = None,
+                 separate_extraction_list_path: Optional[str] = None):
         """
         Initialize the parser with optional GitHub token.
 
         Args:
             token: GitHub personal access token. If None, will try to read from GITHUB_TOKEN env var.
             prignore_path: Path to PRIgnore.txt file. If None, looks in script directory.
+            separate_extraction_list_path: Path to separate_extraction_list.txt file.
+                If None, looks in script directory.
         """
         self.token = token or os.getenv('GITHUB_TOKEN')
         self.headers = {
@@ -30,43 +33,78 @@ class GitHubPRParser:
             self.headers['Authorization'] = f'token {self.token}'
 
         # Load ignore patterns from PRIgnore.txt
+        script_dir = Path(__file__).parent
+
         if prignore_path is None:
-            script_dir = Path(__file__).parent
             prignore_path = script_dir / 'PRIgnore.txt'
+        else:
+            prignore_path = Path(prignore_path)
 
-        self.ignore_patterns = self.load_ignore_patterns(prignore_path)
+        if separate_extraction_list_path is None:
+            separate_extraction_list_path = script_dir / 'separate_extraction_list.txt'
+        else:
+            separate_extraction_list_path = Path(separate_extraction_list_path)
 
-    def load_ignore_patterns(self, prignore_path: Path) -> List[str]:
+        self.ignore_patterns = self.load_patterns_file(prignore_path, 'PRIgnore.txt')
+        self.separate_extraction_patterns = self.load_patterns_file(
+            separate_extraction_list_path,
+            'separate_extraction_list.txt'
+        )
+
+    def load_patterns_file(self, patterns_path: Path, list_name: str) -> List[str]:
         """
-        Load ignore patterns from PRIgnore.txt file.
+        Load glob patterns from a text file.
 
         Args:
-            prignore_path: Path to PRIgnore.txt file
+            patterns_path: Path to patterns file
+            list_name: Display name used in log messages
 
         Returns:
             List of ignore patterns
         """
         patterns = []
 
-        if not prignore_path.exists():
-            print(f"Warning: PRIgnore.txt not found at {prignore_path}")
-            print("Using empty ignore list. Create PRIgnore.txt to configure ignore patterns.")
+        if not patterns_path.exists():
+            print(f"Warning: {list_name} not found at {patterns_path}")
+            print(f"Using empty pattern list. Create {list_name} to configure patterns.")
             return patterns
 
         try:
-            with open(prignore_path, 'r', encoding='utf-8') as f:
+            with open(patterns_path, 'r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
                     # Skip empty lines and comments
                     if line and not line.startswith('#'):
                         patterns.append(line)
 
-            print(f"Loaded {len(patterns)} ignore pattern(s) from PRIgnore.txt")
+            print(f"Loaded {len(patterns)} pattern(s) from {list_name}")
         except Exception as e:
-            print(f"Error reading PRIgnore.txt: {e}")
+            print(f"Error reading {list_name}: {e}")
             print("Continuing with empty ignore list.")
 
         return patterns
+
+    def load_ignore_patterns(self, prignore_path: Path) -> List[str]:
+        """Backward-compatible wrapper for loading PRIgnore.txt."""
+        return self.load_patterns_file(prignore_path, 'PRIgnore.txt')
+
+    def matches_patterns(self, filepath: str, patterns: List[str]) -> bool:
+        """
+        Match a filepath against an ordered list of glob patterns.
+
+        Supports optional negation via leading '!'.
+        Last matching pattern wins.
+        """
+        matched = False
+
+        for pattern in patterns:
+            is_negation = pattern.startswith('!')
+            actual_pattern = pattern[1:] if is_negation else pattern
+
+            if fnmatch(filepath, actual_pattern):
+                matched = not is_negation
+
+        return matched
 
     def parse_pr_url(self, url: str) -> tuple:
         """
@@ -96,10 +134,11 @@ class GitHubPRParser:
         Returns:
             True if file should be ignored, False otherwise
         """
-        for pattern in self.ignore_patterns:
-            if fnmatch(filepath, pattern):
-                return True
-        return False
+        return self.matches_patterns(filepath, self.ignore_patterns)
+
+    def should_extract_separately(self, filepath: str) -> bool:
+        """Check if a file should be separately extracted based on patterns."""
+        return self.matches_patterns(filepath, self.separate_extraction_patterns)
 
     def add_ignore_patterns(self, patterns: List[str]):
         """Add custom ignore patterns."""
@@ -562,7 +601,9 @@ class GitHubPRParser:
         all_files = pr_data['files']
         files = [f for f in all_files if not self.should_ignore(f['filename'])]
         ignored_files = [f['filename'] for f in all_files if self.should_ignore(f['filename'])]
-        file_patches = {f['filename']: f.get('patch', '') for f in all_files}
+        separate_extraction_files = [
+            f for f in all_files if self.should_extract_separately(f['filename'])
+        ]
         comments = pr_data['comments']
 
         # Group files by category
@@ -601,9 +642,6 @@ class GitHubPRParser:
             for filepath, file_comments in comments_by_file.items():
                 if self.should_ignore(filepath):
                     continue
-
-                # Create a map of comment ID to comment
-                comment_map = {c['id']: c for c in file_comments}
 
                 # Find root comments (not replies to other comments)
                 root_comments = [c for c in file_comments if not c['in_reply_to_id']]
@@ -702,7 +740,8 @@ class GitHubPRParser:
             'description': description_md,
             'code': code_md,
             'feedback': feedback_md,
-            'ignored_files': ignored_files
+            'ignored_files': ignored_files,
+            'separate_extraction_files': separate_extraction_files
         }
 
     def save_pr_sections(self, sections: Dict[str, str], pr_number: str, repo_name: str):
@@ -760,6 +799,44 @@ class GitHubPRParser:
             else:
                 f.write("(No files were ignored)\n")
         print(f"  ✓ Saved: PRIgnore_Report.txt ({len(sections['ignored_files'])} files ignored)")
+
+        # Save separately extracted file diffs as markdown files in the PR root folder.
+        separate_files = sections.get('separate_extraction_files', [])
+        used_output_names = set()
+        for file_data in separate_files:
+            filepath = file_data['filename']
+            status = file_data.get('status', '')
+            source_name = PurePosixPath(filepath).name
+            output_name = f"{source_name}.md"
+
+            # Avoid overwriting when two files share the same base filename.
+            if output_name in used_output_names:
+                source_stem = PurePosixPath(filepath).stem
+                source_suffix = PurePosixPath(filepath).suffix
+                counter = 2
+                while True:
+                    candidate = f"{source_stem}__{counter}{source_suffix}.md"
+                    if candidate not in used_output_names:
+                        output_name = candidate
+                        break
+                    counter += 1
+
+            used_output_names.add(output_name)
+            output_file = pr_folder / output_name
+            extracted_md = self.format_code_changes(file_data)
+
+            with open(output_file, 'w', encoding='utf-8') as f:
+                if extracted_md:
+                    f.write(extracted_md)
+                else:
+                    # Keep fallback output in markdown when GitHub provides no textual patch.
+                    f.write(f"### `{filepath}`\n\n")
+                    f.write("No textual patch available from GitHub for this file.\n\n")
+                    f.write(f"- Status: `{status}`\n")
+
+        print(
+            f"  ✓ Saved: {len(separate_files)} separately extracted markdown diff file(s)"
+        )
 
         print(f"\n✓ All files saved to: {pr_folder}")
 
@@ -845,6 +922,18 @@ def main():
     else:
         print("\n⚠ No ignore patterns loaded (PRIgnore.txt is empty or not found)")
         print("  Edit PRIgnore.txt in the repository to configure ignore patterns")
+
+    # Show loaded separate extraction patterns
+    if parser.separate_extraction_patterns:
+        print(
+            f"\nSeparate extraction patterns loaded from separate_extraction_list.txt "
+            f"({len(parser.separate_extraction_patterns)} patterns):"
+        )
+        for pattern in parser.separate_extraction_patterns:
+            print(f"  - {pattern}")
+    else:
+        print("\n⚠ No separate extraction patterns loaded")
+        print("  Edit separate_extraction_list.txt in the repository to configure patterns")
     print()
 
     # Get PR URL from user

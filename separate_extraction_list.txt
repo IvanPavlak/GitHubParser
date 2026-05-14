@@ -1,0 +1,13 @@
+# separate_extraction_list.txt - Patterns for separately extracted changed files
+# One glob pattern per line. Supports wildcard matching.
+#
+# Files that match these patterns are additionally extracted to:
+#   <Desktop>/PR_<number>_<repo>/<source-filename>.md
+# and contain diff-style markdown content.
+#
+# Starters
+*appsettings*.json
+**/appsettings*.json
+*CHANGELOG*.md
+**/*CHANGELOG*.md
+**/*.csproj

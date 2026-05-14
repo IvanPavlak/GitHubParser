@@ -36,7 +36,6 @@
 
 # Documentation (uncomment if you want to ignore)
 **/*.md
-CHANGELOG.md
 # **/docs/*
 
 # Translations and appsettings
