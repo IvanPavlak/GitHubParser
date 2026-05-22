@@ -141,7 +141,9 @@ Pattern behavior:
 
 ### SeparateExtractionList.txt
 
-Controls which changed files get extra standalone markdown diff files in the output root.
+Controls which changed files get standalone markdown diff files in the output root.
+
+Files that match these patterns are excluded from main outputs (`Description.md` and `Code.md`) so they appear only in their dedicated extracted files.
 
 Current starter patterns include:
 
@@ -154,6 +156,8 @@ Current starter patterns include:
 ### Code.md and separate extraction files
 
 Diffs are rendered in markdown code blocks with old/new sections when patch data is available.
+
+Files matched by `SeparateExtractionList.txt` are not included in `Code.md`; they are written only to separate extracted markdown files.
 
 When GitHub does not provide textual patch data for a file, the separate extraction file still gets created with a markdown note and status.
 

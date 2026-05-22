@@ -608,10 +608,16 @@ class GitHubPRParser:
             Dictionary with 'description', 'code', and 'feedback' markdown sections
         """
         all_files = pr_data['files']
-        files = [f for f in all_files if not self.should_ignore(f['filename'])]
         ignored_files = [f['filename'] for f in all_files if self.should_ignore(f['filename'])]
         separate_extraction_files = [
             f for f in all_files if self.should_extract_separately(f['filename'])
+        ]
+
+        # Files matched for separate extraction are excluded from main outputs
+        # (Description.md and Code.md) and are represented via standalone files.
+        files = [
+            f for f in all_files
+            if not self.should_ignore(f['filename']) and not self.should_extract_separately(f['filename'])
         ]
         comments = pr_data['comments']
 
@@ -750,7 +756,8 @@ class GitHubPRParser:
             'code': code_md,
             'feedback': feedback_md,
             'ignored_files': ignored_files,
-            'separate_extraction_files': separate_extraction_files
+            'separate_extraction_files': separate_extraction_files,
+            'main_output_files': [f['filename'] for f in files]
         }
 
     def save_pr_sections(self, sections: Dict[str, str], pr_number: str, repo_name: str):
@@ -899,9 +906,13 @@ class GitHubPRParser:
             print("Generating markdown sections...")
             sections = self.generate_markdown_sections(pr_data)
 
-            # Count processed files
-            processed_files = total_files - len(sections['ignored_files'])
-            print(f"Processing {processed_files} files ({len(sections['ignored_files'])} ignored)")
+            # Count files included in main Description/Code outputs.
+            processed_files = len(sections.get('main_output_files', []))
+            print(
+                f"Processing {processed_files} files "
+                f"({len(sections['ignored_files'])} ignored, "
+                f"{len(sections.get('separate_extraction_files', []))} separately extracted)"
+            )
 
             # Save to desktop in separate files
             repo_name = f"{owner}_{repo}"
