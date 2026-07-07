@@ -1,4 +1,4 @@
-# PRIgnore.txt - Patterns for files to ignore when parsing Pull Requests
+# Ignore.txt - Patterns for files to ignore when parsing a PR or commit
 # Similar to .gitignore, one pattern per line
 # Supports wildcard matching using glob patterns
 #

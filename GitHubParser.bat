@@ -2,12 +2,12 @@
 
 set "script_dir=%~dp0"
 
-if not exist "%script_dir%GitHubPullRequestParser.config.bat" (
-	echo Missing config file: %script_dir%GitHubPullRequestParser.config.bat
+if not exist "%script_dir%GitHubParser.config.bat" (
+	echo Missing config file: %script_dir%GitHubParser.config.bat
 	exit /b 1
 )
 
-call "%script_dir%GitHubPullRequestParser.config.bat"
+call "%script_dir%GitHubParser.config.bat"
 
 if not defined conda_base (
 	echo Missing required config value: conda_base
@@ -26,4 +26,4 @@ if not defined python_script (
 
 call "%conda_base%\Scripts\activate.bat" "%conda_base%"
 call conda activate "%conda_prefix%"
-python "%python_script%"
+python "%python_script%" %*

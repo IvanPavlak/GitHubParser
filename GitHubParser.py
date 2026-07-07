@@ -1,27 +1,81 @@
 #!/usr/bin/env python3
 """
-GitHub Pull Request Parser
-Extracts PR information and formats it into a structured markdown file.
+GitHub Parser
+Extracts information from a GitHub pull request or commit and formats it into
+structured markdown files.
+
+Supports selective extraction of sections (description, code, feedback) so you
+can, for example, pull only the feedback/comments for a commit.
 """
 
 import os
 import re
+import sys
 import getpass
+import argparse
 import requests
 from pathlib import Path, PurePosixPath
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Sequence
 from fnmatch import fnmatch
 
 
-class GitHubPRParser:
-    def __init__(self, token: Optional[str] = None, prignore_path: Optional[str] = None,
+# Canonical output sections and friendly aliases.
+ALL_SECTIONS = ['description', 'code', 'feedback']
+SECTION_ALIASES = {
+    'comments': 'feedback',
+    'comment': 'feedback',
+    'feedbacks': 'feedback',
+    'desc': 'description',
+    'descriptions': 'description',
+}
+
+
+def resolve_sections(raw: Optional[str]) -> List[str]:
+    """
+    Resolve a raw ``--sections`` value into an ordered list of canonical sections.
+
+    Accepts comma/semicolon/space separated tokens, the special token ``all``,
+    and the aliases in :data:`SECTION_ALIASES` (e.g. ``comments`` -> ``feedback``).
+    An empty/``None`` value means "all sections".
+
+    Args:
+        raw: The raw sections string (e.g. "feedback", "code,feedback", "all").
+
+    Returns:
+        Ordered list of canonical section names, deduplicated, following
+        :data:`ALL_SECTIONS` order.
+    """
+    if not raw:
+        return list(ALL_SECTIONS)
+
+    tokens = [t.strip().lower() for t in re.split(r'[,;\s]+', raw) if t.strip()]
+    if not tokens or 'all' in tokens:
+        return list(ALL_SECTIONS)
+
+    requested = set()
+    for token in tokens:
+        canonical = SECTION_ALIASES.get(token, token)
+        if canonical not in ALL_SECTIONS:
+            valid = ', '.join(ALL_SECTIONS)
+            raise ValueError(
+                f"Unknown section '{token}'. Choose from: {valid} "
+                f"(alias: comments=feedback)."
+            )
+        requested.add(canonical)
+
+    # Preserve canonical ordering regardless of the order tokens were given in.
+    return [s for s in ALL_SECTIONS if s in requested]
+
+
+class GitHubParser:
+    def __init__(self, token: Optional[str] = None, ignore_path: Optional[str] = None,
                  separate_extraction_list_path: Optional[str] = None):
         """
-        Initialize the parser with optional GitHub token.
+        Initialize the parser with an optional GitHub token.
 
         Args:
             token: GitHub personal access token. If None, will try to read from GITHUB_TOKEN env var.
-            prignore_path: Path to PRIgnore.txt file. If None, looks in script directory.
+            ignore_path: Path to Ignore.txt file. If None, looks in script directory.
             separate_extraction_list_path: Path to SeparateExtractionList.txt file.
                 If None, looks in script directory.
         """
@@ -32,20 +86,20 @@ class GitHubPRParser:
         if self.token:
             self.headers['Authorization'] = f'token {self.token}'
 
-        # Load ignore patterns from PRIgnore.txt
+        # Load ignore patterns from Ignore.txt
         script_dir = Path(__file__).parent
 
-        if prignore_path is None:
-            prignore_path = script_dir / 'PRIgnore.txt'
+        if ignore_path is None:
+            ignore_path = script_dir / 'Ignore.txt'
         else:
-            prignore_path = Path(prignore_path)
+            ignore_path = Path(ignore_path)
 
         if separate_extraction_list_path is None:
             separate_extraction_list_path = script_dir / 'SeparateExtractionList.txt'
         else:
             separate_extraction_list_path = Path(separate_extraction_list_path)
 
-        self.ignore_patterns = self.load_patterns_file(prignore_path, 'PRIgnore.txt')
+        self.ignore_patterns = self.load_patterns_file(ignore_path, 'Ignore.txt')
         self.separate_extraction_patterns = self.load_patterns_file(
             separate_extraction_list_path,
             'SeparateExtractionList.txt'
@@ -84,9 +138,9 @@ class GitHubPRParser:
 
         return patterns
 
-    def load_ignore_patterns(self, prignore_path: Path) -> List[str]:
-        """Backward-compatible wrapper for loading PRIgnore.txt."""
-        return self.load_patterns_file(prignore_path, 'PRIgnore.txt')
+    def load_ignore_patterns(self, ignore_path: Path) -> List[str]:
+        """Backward-compatible wrapper for loading Ignore.txt."""
+        return self.load_patterns_file(ignore_path, 'Ignore.txt')
 
     def matches_patterns(self, filepath: str, patterns: List[str]) -> bool:
         """
@@ -115,23 +169,40 @@ class GitHubPRParser:
 
         return matched
 
-    def parse_pr_url(self, url: str) -> tuple:
+    def parse_url(self, url: str) -> Dict[str, str]:
         """
-        Parse GitHub PR URL to extract owner, repo, and PR number.
+        Parse a GitHub pull request or commit URL.
+
+        Supports:
+            - Pull requests: https://github.com/owner/repo/pull/123
+            - Commits:       https://github.com/owner/repo/commit/<sha>
+
+        Any trailing fragment (e.g. ``#diff-<hash>`` pointing at a specific
+        file) or query string is ignored.
 
         Args:
-            url: GitHub PR URL (e.g., https://github.com/owner/repo/pull/123)
+            url: GitHub PR or commit URL
 
         Returns:
-            Tuple of (owner, repo, pr_number)
+            Dict with keys: owner, repo, kind ('pull' | 'commit'), identifier
         """
-        pattern = r'github\.com/([^/]+)/([^/]+)/pull/(\d+)'
-        match = re.search(pattern, url)
-        if not match:
-            raise ValueError(f"Invalid GitHub PR URL: {url}")
+        pr_match = re.search(r'github\.com/([^/]+)/([^/]+)/pull/(\d+)', url)
+        if pr_match:
+            owner, repo, number = pr_match.groups()
+            return {'owner': owner, 'repo': repo, 'kind': 'pull', 'identifier': number}
 
-        owner, repo, pr_number = match.groups()
-        return owner, repo, pr_number
+        commit_match = re.search(
+            r'github\.com/([^/]+)/([^/]+)/commit/([0-9a-fA-F]{7,40})', url
+        )
+        if commit_match:
+            owner, repo, sha = commit_match.groups()
+            return {'owner': owner, 'repo': repo, 'kind': 'commit', 'identifier': sha}
+
+        raise ValueError(
+            f"Unrecognized GitHub URL: {url}\n"
+            f"Expected a pull request URL (.../pull/123) or a commit URL "
+            f"(.../commit/<sha>)."
+        )
 
     def should_ignore(self, filepath: str) -> bool:
         """
@@ -194,7 +265,7 @@ class GitHubPRParser:
 
     def fetch_paginated(self, url: str, resource_name: str) -> List[Dict[str, Any]]:
         """
-        Fetch all pages of a paginated GitHub API endpoint.
+        Fetch all pages of a paginated GitHub API endpoint that returns a JSON array.
 
         Args:
             url: The API endpoint URL
@@ -227,7 +298,47 @@ class GitHubPRParser:
 
         return all_items
 
-    def fetch_pr_data(self, owner: str, repo: str, pr_number: str) -> Dict[str, Any]:
+    def _handle_not_found(self, kind: str):
+        """Raise a helpful error message for a 404 based on auth state."""
+        subject = 'PR' if kind == 'pull' else 'commit'
+        if self.token:
+            raise ValueError(
+                f"{subject} not found or you don't have access to it.\n"
+                f"Please verify:\n"
+                f"  1. The URL is correct\n"
+                f"  2. Your GitHub token has the correct permissions (repo scope for private repos)\n"
+                f"  3. The repository and {subject} exist"
+            )
+        raise ValueError(
+            f"{subject} not found. This could mean:\n"
+            f"  1. The repository is private and requires authentication\n"
+            f"  2. The URL is incorrect\n"
+            f"  3. The repository or {subject} doesn't exist\n\n"
+            f"To access private repositories, set the GITHUB_TOKEN environment variable:\n"
+            f"  Windows (PowerShell): $env:GITHUB_TOKEN = 'your_token_here'\n"
+            f"  Windows (CMD): set GITHUB_TOKEN=your_token_here\n\n"
+            f"Create a token at: https://github.com/settings/tokens"
+        )
+
+    def fetch_data(self, parsed: Dict[str, str]) -> Dict[str, Any]:
+        """
+        Fetch data for a parsed pull request or commit URL.
+
+        Args:
+            parsed: Result of :meth:`parse_url`
+
+        Returns:
+            Unified dict: {kind, owner, repo, identifier, meta, files, comments}
+        """
+        if parsed['kind'] == 'pull':
+            return self.fetch_pull_data(
+                parsed['owner'], parsed['repo'], parsed['identifier']
+            )
+        return self.fetch_commit_data(
+            parsed['owner'], parsed['repo'], parsed['identifier']
+        )
+
+    def fetch_pull_data(self, owner: str, repo: str, pr_number: str) -> Dict[str, Any]:
         """
         Fetch PR data from GitHub API with pagination support.
 
@@ -237,7 +348,7 @@ class GitHubPRParser:
             pr_number: Pull request number
 
         Returns:
-            Dictionary containing PR data
+            Unified data dict for the pull request
         """
         base_url = f'https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}'
 
@@ -245,43 +356,89 @@ class GitHubPRParser:
 
         # Fetch PR details
         pr_response = requests.get(base_url, headers=self.headers)
-
         if pr_response.status_code == 404:
-            if self.token:
-                raise ValueError(
-                    f"PR not found or you don't have access to it.\n"
-                    f"Please verify:\n"
-                    f"  1. The PR URL is correct\n"
-                    f"  2. Your GitHub token has the correct permissions (repo scope for private repos)\n"
-                    f"  3. The repository and PR exist"
-                )
-            else:
-                raise ValueError(
-                    f"PR not found. This could mean:\n"
-                    f"  1. The repository is private and requires authentication\n"
-                    f"  2. The PR URL is incorrect\n"
-                    f"  3. The repository or PR doesn't exist\n\n"
-                    f"To access private repositories, set the GITHUB_TOKEN environment variable:\n"
-                    f"  Windows (PowerShell): $env:GITHUB_TOKEN = 'your_token_here'\n"
-                    f"  Windows (CMD): set GITHUB_TOKEN=your_token_here\n\n"
-                    f"Create a token at: https://github.com/settings/tokens"
-                )
-
+            self._handle_not_found('pull')
         pr_response.raise_for_status()
         pr_data = pr_response.json()
 
         # Fetch files changed (with pagination)
         print("\nFetching changed files...")
-        files_url = f'{base_url}/files'
-        files_data = self.fetch_paginated(files_url, 'files')
+        files_data = self.fetch_paginated(f'{base_url}/files', 'files')
 
         # Fetch review comments (with pagination)
         print("\nFetching review comments...")
-        comments_url = f'{base_url}/comments'
-        comments_data = self.fetch_paginated(comments_url, 'comments')
+        comments_data = self.fetch_paginated(f'{base_url}/comments', 'comments')
 
         return {
-            'pr': pr_data,
+            'kind': 'pull',
+            'owner': owner,
+            'repo': repo,
+            'identifier': pr_number,
+            'meta': pr_data,
+            'files': files_data,
+            'comments': comments_data,
+        }
+
+    def fetch_commit_data(self, owner: str, repo: str, sha: str) -> Dict[str, Any]:
+        """
+        Fetch commit data from GitHub API with pagination support.
+
+        The commit endpoint returns the commit object with an embedded ``files``
+        array. Large commits paginate the files across pages of the same object,
+        so we walk pages until the files run out.
+
+        Args:
+            owner: Repository owner
+            repo: Repository name
+            sha: Commit SHA
+
+        Returns:
+            Unified data dict for the commit
+        """
+        base_url = f'https://api.github.com/repos/{owner}/{repo}/commits/{sha}'
+
+        print(f"Fetching commit data from {base_url}...")
+
+        # Fetch commit details (page 1 carries the metadata + first slice of files)
+        commit_response = requests.get(
+            base_url, headers=self.headers, params={'per_page': 100, 'page': 1}
+        )
+        if commit_response.status_code == 404:
+            self._handle_not_found('commit')
+        commit_response.raise_for_status()
+        commit_data = commit_response.json()
+
+        print("\nCollecting changed files...")
+        files_data = list(commit_data.get('files', []) or [])
+        print(f"  Fetched page 1 ({len(files_data)} files, total: {len(files_data)})")
+
+        # Continue paginating files for very large commits.
+        if len(files_data) == 100:
+            page = 2
+            while True:
+                response = requests.get(
+                    base_url, headers=self.headers, params={'per_page': 100, 'page': page}
+                )
+                response.raise_for_status()
+                page_files = response.json().get('files', []) or []
+                if not page_files:
+                    break
+                files_data.extend(page_files)
+                print(f"  Fetched page {page} ({len(page_files)} files, total: {len(files_data)})")
+                if len(page_files) < 100:
+                    break
+                page += 1
+
+        # Fetch commit comments (with pagination)
+        print("\nFetching commit comments...")
+        comments_data = self.fetch_paginated(f'{base_url}/comments', 'comments')
+
+        return {
+            'kind': 'commit',
+            'owner': owner,
+            'repo': repo,
+            'identifier': sha,
+            'meta': commit_data,
             'files': files_data,
             'comments': comments_data,
         }
@@ -566,6 +723,10 @@ class GitHubPRParser:
         """
         Group and format comments by file.
 
+        Handles both PR review comments (which carry diff_hunk / reply threading)
+        and commit comments (which do not). Missing fields degrade gracefully via
+        ``.get()`` defaults.
+
         Args:
             comments: List of comment data from GitHub API
 
@@ -575,14 +736,14 @@ class GitHubPRParser:
         comments_by_file = {}
 
         for comment in comments:
-            filepath = comment.get('path', 'General')
+            filepath = comment.get('path') or 'General'
 
             if filepath not in comments_by_file:
                 comments_by_file[filepath] = []
 
             comments_by_file[filepath].append({
-                'author': comment['user']['login'],
-                'body': comment['body'],
+                'author': (comment.get('user') or {}).get('login', 'unknown'),
+                'body': comment.get('body', ''),
                 'code': comment.get('diff_hunk', ''),
                 'position': comment.get('position', 0),
                 'id': comment.get('id'),
@@ -597,17 +758,182 @@ class GitHubPRParser:
 
         return comments_by_file
 
-    def generate_markdown_sections(self, pr_data: Dict[str, Any]) -> Dict[str, str]:
+    def _build_description_md(self, files_by_category: Dict[str, List[Dict[str, Any]]]) -> str:
+        """Build the Description.md content from categorized files."""
+        description_md = "# Description\n\n"
+        for category in sorted(files_by_category.keys()):
+            description_md += f"## {category}\n\n"
+            for file_data in files_by_category[category]:
+                filepath = file_data['filename']
+                description_md += f"### `{filepath}`\n\n"
+                description_md += "- Description\n\n"
+        return description_md
+
+    def _build_code_md(self, files_by_category: Dict[str, List[Dict[str, Any]]]) -> str:
+        """Build the Code.md content from categorized files."""
+        code_md = "# Code\n\n"
+        for category in sorted(files_by_category.keys()):
+            code_md += f"## {category}\n\n"
+            for file_data in files_by_category[category]:
+                code_md += self.format_code_changes(file_data)
+        return code_md
+
+    def _build_feedback_md(self, comments: List[Dict[str, Any]],
+                           files_by_path: Dict[str, Dict[str, Any]]) -> str:
         """
-        Generate separate markdown sections.
+        Build the Feedback.md content from comments.
+
+        Code context for a comment is sourced from the comment's diff_hunk
+        (PR review comments). When no diff_hunk is present (commit comments),
+        it falls back to the file's full patch using the comment's line number.
+        """
+        feedback_md = "# Feedback\n\n"
+        comments_by_file = self.format_comments(comments)
+
+        if not comments_by_file:
+            feedback_md += "No comments found.\n"
+            return feedback_md
+
+        # First, build conversation threads based on reply chains.
+        all_threads = []
+        for filepath, file_comments in comments_by_file.items():
+            if filepath != 'General' and self.should_ignore(filepath):
+                continue
+
+            # Find root comments (not replies to other comments).
+            root_comments = [c for c in file_comments if not c['in_reply_to_id']]
+
+            # Build threads: each root comment + all its replies.
+            for root_comment in root_comments:
+                thread = [root_comment]
+
+                # Find all replies to this root comment. Guard against a
+                # None == None match (commit comments / comments without ids)
+                # which would otherwise make a comment a reply to itself.
+                replies = [
+                    c for c in file_comments
+                    if c['in_reply_to_id'] is not None
+                    and c['in_reply_to_id'] == root_comment['id']
+                ]
+                thread.extend(replies)
+
+                # Also check for nested replies (replies to replies).
+                for reply in replies:
+                    nested_replies = [
+                        c for c in file_comments
+                        if c['in_reply_to_id'] is not None
+                        and c['in_reply_to_id'] == reply['id']
+                    ]
+                    thread.extend(nested_replies)
+
+                all_threads.append({
+                    'filepath': filepath,
+                    'comments': thread
+                })
+
+        if not all_threads:
+            feedback_md += "No comments found.\n"
+            return feedback_md
+
+        # Now process each thread with its own file header and code context.
+        for thread in all_threads:
+            filepath = thread['filepath']
+            thread_comments = thread['comments']
+
+            # File header for each comment/conversation.
+            feedback_md += f"### `{filepath}`\n\n"
+
+            # Show code context for this thread.
+            first_comment = thread_comments[0]
+            comment_line = first_comment.get('line', 0) or 0
+            start_line = first_comment.get('start_line') or None
+
+            # Prefer the diff_hunk (PR review comments); fall back to the file's
+            # full patch (commit comments have no diff_hunk).
+            source_patch = first_comment['code']
+            if not source_patch and filepath != 'General':
+                file_data = files_by_path.get(filepath)
+                if file_data:
+                    source_patch = file_data.get('patch', '')
+
+            if source_patch:
+                extension = self.get_file_extension(filepath)
+                context_lines = self.extract_comment_context(
+                    source_patch,
+                    comment_line=comment_line,
+                    start_line=start_line,
+                )
+
+                if context_lines:
+                    feedback_md += f"```{extension}\n"
+                    feedback_md += '\n'.join(context_lines)
+                    feedback_md += "\n```\n\n"
+
+            # Format comments based on thread size.
+            if len(thread_comments) == 1:
+                # Single comment - use bullet format with cleaned body.
+                comment = thread_comments[0]
+                # Clean up extra newlines in comment body.
+                clean_body = re.sub(r'\n\n+', '\n', comment['body']).strip()
+                feedback_md += f"- `{comment['author']}` → {clean_body}\n\n"
+            else:
+                # Multiple comments - format as conversation in code block.
+                feedback_md += "```\n"
+                for i, comment in enumerate(thread_comments):
+                    author = comment['author']
+                    body = comment['body']
+
+                    # Clean up extra newlines - collapse multiple blank lines to single blank line.
+                    clean_body = re.sub(r'\n\n+', '\n\n', body).strip()
+
+                    # Format with author and arrow.
+                    feedback_md += f"- {author} → "
+
+                    # Check if body is multi-line.
+                    if '\n' in clean_body:
+                        # Multi-line: put content on next line with indentation.
+                        feedback_md += "\n\n"
+                        # Indent all lines, but don't add spaces to blank lines.
+                        lines = clean_body.split('\n')
+                        indented_lines = []
+                        for line in lines:
+                            if line.strip():  # Non-blank line
+                                indented_lines.append('    ' + line)
+                            else:  # Blank line
+                                indented_lines.append('')
+                        indented_body = '\n'.join(indented_lines)
+                        feedback_md += indented_body
+                    else:
+                        # Single line: keep on same line.
+                        feedback_md += clean_body
+
+                    # Add spacing between comments.
+                    if i < len(thread_comments) - 1:
+                        feedback_md += "\n\n"
+
+                feedback_md += "\n```\n\n"
+
+        return feedback_md
+
+    def generate_markdown_sections(self, data: Dict[str, Any],
+                                   sections: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+        """
+        Generate the requested markdown sections.
 
         Args:
-            pr_data: Complete PR data including files and comments
+            data: Unified data dict from :meth:`fetch_data`
+            sections: Which sections to generate. Any subset of
+                ``description``, ``code``, ``feedback``. Defaults to all.
 
         Returns:
-            Dictionary with 'description', 'code', and 'feedback' markdown sections
+            Dictionary containing the requested markdown sections plus file
+            bookkeeping (ignored_files, separate_extraction_files, main_output_files).
         """
-        all_files = pr_data['files']
+        sections = list(sections) if sections else list(ALL_SECTIONS)
+
+        all_files = data['files']
+        comments = data['comments']
+
         ignored_files = [f['filename'] for f in all_files if self.should_ignore(f['filename'])]
         separate_extraction_files = [
             f for f in all_files if self.should_extract_separately(f['filename'])
@@ -619,190 +945,101 @@ class GitHubPRParser:
             f for f in all_files
             if not self.should_ignore(f['filename']) and not self.should_extract_separately(f['filename'])
         ]
-        comments = pr_data['comments']
 
-        # Group files by category
+        # Group files by category (used by description + code).
         files_by_category = {}
         for file_data in files:
             category = self.categorize_file(file_data['filename'])
-            if category not in files_by_category:
-                files_by_category[category] = []
-            files_by_category[category].append(file_data)
+            files_by_category.setdefault(category, []).append(file_data)
 
-        # === Description Section ===
-        description_md = "# Description\n\n"
+        # Map every changed file by path (used by feedback for code context).
+        files_by_path = {f['filename']: f for f in all_files}
 
-        for category in sorted(files_by_category.keys()):
-            description_md += f"## {category}\n\n"
-            for file_data in files_by_category[category]:
-                filepath = file_data['filename']
-                description_md += f"### `{filepath}`\n\n"
-                description_md += "- Description\n\n"
-
-        # === Code Section ===
-        code_md = "# Code\n\n"
-
-        for category in sorted(files_by_category.keys()):
-            code_md += f"## {category}\n\n"
-            for file_data in files_by_category[category]:
-                code_md += self.format_code_changes(file_data)
-
-        # === Feedback Section ===
-        feedback_md = "# Feedback\n\n"
-        comments_by_file = self.format_comments(comments)
-
-        if comments_by_file:
-            # First, build conversation threads based on reply chains
-            all_threads = []
-            for filepath, file_comments in comments_by_file.items():
-                if self.should_ignore(filepath):
-                    continue
-
-                # Find root comments (not replies to other comments)
-                root_comments = [c for c in file_comments if not c['in_reply_to_id']]
-
-                # Build threads: each root comment + all its replies
-                for root_comment in root_comments:
-                    thread = [root_comment]
-
-                    # Find all replies to this root comment
-                    replies = [c for c in file_comments if c['in_reply_to_id'] == root_comment['id']]
-                    thread.extend(replies)
-
-                    # Also check for nested replies (replies to replies)
-                    for reply in replies:
-                        nested_replies = [c for c in file_comments if c['in_reply_to_id'] == reply['id']]
-                        thread.extend(nested_replies)
-
-                    all_threads.append({
-                        'filepath': filepath,
-                        'comments': thread
-                    })
-
-            # Now process each thread with its own file header and code context
-            for thread in all_threads:
-                filepath = thread['filepath']
-                thread_comments = thread['comments']
-
-                # File header for each comment/conversation
-                feedback_md += f"### `{filepath}`\n\n"
-
-                # Show code context for this thread
-                first_comment = thread_comments[0]
-                if first_comment['code']:
-                    extension = self.get_file_extension(filepath)
-                    comment_line = first_comment.get('line', 0) or 0
-                    start_line = first_comment.get('start_line') or None
-                    context_lines = self.extract_comment_context(
-                        first_comment['code'],
-                        comment_line=comment_line,
-                        start_line=start_line,
-                    )
-
-                    if context_lines:
-                        feedback_md += f"```{extension}\n"
-                        feedback_md += '\n'.join(context_lines)
-                        feedback_md += "\n```\n\n"
-
-                # Format comments based on thread size
-                if len(thread_comments) == 1:
-                    # Single comment - use bullet format with cleaned body
-                    comment = thread_comments[0]
-                    # Clean up extra newlines in comment body
-                    clean_body = re.sub(r'\n\n+', '\n', comment['body']).strip()
-                    feedback_md += f"- `{comment['author']}` → {clean_body}\n\n"
-                else:
-                    # Multiple comments - format as conversation in code block
-                    feedback_md += "```\n"
-                    for i, comment in enumerate(thread_comments):
-                        author = comment['author']
-                        body = comment['body']
-
-                        # Clean up extra newlines - collapse multiple blank lines to single blank line
-                        clean_body = re.sub(r'\n\n+', '\n\n', body).strip()
-
-                        # Format with author and arrow
-                        feedback_md += f"- {author} → "
-
-                        # Check if body is multi-line
-                        if '\n' in clean_body:
-                            # Multi-line: put content on next line with indentation
-                            feedback_md += "\n\n"
-                            # Indent all lines, but don't add spaces to blank lines
-                            lines = clean_body.split('\n')
-                            indented_lines = []
-                            for line in lines:
-                                if line.strip():  # Non-blank line
-                                    indented_lines.append('    ' + line)
-                                else:  # Blank line
-                                    indented_lines.append('')
-                            indented_body = '\n'.join(indented_lines)
-                            feedback_md += indented_body
-                        else:
-                            # Single line: keep on same line
-                            feedback_md += clean_body
-
-                        # Add spacing between comments
-                        if i < len(thread_comments) - 1:
-                            feedback_md += "\n\n"
-
-                    feedback_md += "\n```\n\n"
-
-        else:
-            feedback_md += "No comments found.\n"
-
-        return {
-            'description': description_md,
-            'code': code_md,
-            'feedback': feedback_md,
+        result: Dict[str, Any] = {
+            'sections': sections,
             'ignored_files': ignored_files,
             'separate_extraction_files': separate_extraction_files,
-            'main_output_files': [f['filename'] for f in files]
+            'main_output_files': [f['filename'] for f in files],
         }
 
-    def save_pr_sections(self, sections: Dict[str, str], pr_number: str, repo_name: str):
+        if 'description' in sections:
+            result['description'] = self._build_description_md(files_by_category)
+        if 'code' in sections:
+            result['code'] = self._build_code_md(files_by_category)
+        if 'feedback' in sections:
+            result['feedback'] = self._build_feedback_md(comments, files_by_path)
+
+        return result
+
+    def _output_folder_name(self, kind: str, identifier: str, repo_name: str) -> str:
+        """Build the output folder name for a PR or commit."""
+        safe_repo = repo_name.replace('/', '_')
+        if kind == 'commit':
+            short_sha = identifier[:7]
+            return f"Commit_{short_sha}_{safe_repo}"
+        return f"PR_{identifier}_{safe_repo}"
+
+    def save_sections(self, sections: Dict[str, Any], kind: str,
+                      identifier: str, repo_name: str):
         """
-        Save PR sections to separate files in a folder on the desktop.
+        Save the generated sections to separate files in a folder on the desktop.
+
+        Only the sections that were requested are written. The ignore/separate
+        extraction reports and standalone extraction files are written only when
+        a file-based section (description or code) was requested.
 
         Args:
-            sections: Dictionary containing markdown sections and ignored files
-            pr_number: PR number
-            repo_name: Repository name
+            sections: Dictionary from :meth:`generate_markdown_sections`
+            kind: 'pull' or 'commit'
+            identifier: PR number or commit SHA
+            repo_name: Repository name (owner_repo)
         """
+        requested = sections.get('sections', list(ALL_SECTIONS))
+        file_sections_requested = 'description' in requested or 'code' in requested
+
         desktop = Path.home() / 'Desktop'
-        folder_name = f"PR_{pr_number}_{repo_name.replace('/', '_')}"
-        pr_folder = desktop / folder_name
+        folder_name = self._output_folder_name(kind, identifier, repo_name)
+        output_folder = desktop / folder_name
 
         # Create folder
-        pr_folder.mkdir(exist_ok=True)
-        print(f"\nCreating PR folder: {pr_folder}")
+        output_folder.mkdir(exist_ok=True)
+        print(f"\nCreating output folder: {output_folder}")
 
         # Save Description.md
-        desc_file = pr_folder / 'Description.md'
-        with open(desc_file, 'w', encoding='utf-8') as f:
-            f.write(sections['description'])
-        print(f"  ✓ Saved: Description.md")
+        if 'description' in sections:
+            desc_file = output_folder / 'Description.md'
+            with open(desc_file, 'w', encoding='utf-8') as f:
+                f.write(sections['description'])
+            print("  ✓ Saved: Description.md")
 
         # Save Code.md
-        code_file = pr_folder / 'Code.md'
-        with open(code_file, 'w', encoding='utf-8') as f:
-            f.write(sections['code'])
-        print(f"  ✓ Saved: Code.md")
+        if 'code' in sections:
+            code_file = output_folder / 'Code.md'
+            with open(code_file, 'w', encoding='utf-8') as f:
+                f.write(sections['code'])
+            print("  ✓ Saved: Code.md")
 
         # Save Feedback.md
-        feedback_file = pr_folder / 'Feedback.md'
-        with open(feedback_file, 'w', encoding='utf-8') as f:
-            f.write(sections['feedback'])
-        print(f"  ✓ Saved: Feedback.md")
+        if 'feedback' in sections:
+            feedback_file = output_folder / 'Feedback.md'
+            with open(feedback_file, 'w', encoding='utf-8') as f:
+                f.write(sections['feedback'])
+            print("  ✓ Saved: Feedback.md")
 
-        # Save PRIgnore_Report.txt
-        prignore_report_file = pr_folder / 'PRIgnore_Report.txt'
-        with open(prignore_report_file, 'w', encoding='utf-8') as f:
-            f.write("# PRIgnore Report\n")
-            f.write("# This report shows which files were ignored during PR parsing\n\n")
+        # The reports and standalone extraction files describe file-level
+        # handling, so only emit them when a file-based section was requested.
+        if not file_sections_requested:
+            print(f"\n✓ All files saved to: {output_folder}")
+            return
+
+        # Save Ignore_Report.txt
+        ignore_report_file = output_folder / 'Ignore_Report.txt'
+        with open(ignore_report_file, 'w', encoding='utf-8') as f:
+            f.write("# Ignore Report\n")
+            f.write("# This report shows which files were ignored during parsing\n\n")
 
             f.write("## Ignore Patterns Used\n")
-            f.write(f"# Loaded from: PRIgnore.txt in repository\n")
+            f.write("# Loaded from: Ignore.txt in repository\n")
             f.write(f"# Total patterns: {len(self.ignore_patterns)}\n\n")
             for pattern in self.ignore_patterns:
                 f.write(f"{pattern}\n")
@@ -814,9 +1051,9 @@ class GitHubPRParser:
                     f.write(f"{ignored_file}\n")
             else:
                 f.write("(No files were ignored)\n")
-        print(f"  ✓ Saved: PRIgnore_Report.txt ({len(sections['ignored_files'])} files ignored)")
+        print(f"  ✓ Saved: Ignore_Report.txt ({len(sections['ignored_files'])} files ignored)")
 
-        # Save separately extracted file diffs as markdown files in the PR root folder.
+        # Save separately extracted file diffs as markdown files in the root folder.
         separate_files = sections.get('separate_extraction_files', [])
         used_output_names = set()
         generated_extraction_files = []
@@ -839,7 +1076,7 @@ class GitHubPRParser:
                     counter += 1
 
             used_output_names.add(output_name)
-            output_file = pr_folder / output_name
+            output_file = output_folder / output_name
             extracted_md = self.format_code_changes(file_data)
             generated_extraction_files.append((filepath, output_name))
 
@@ -852,7 +1089,7 @@ class GitHubPRParser:
                     f.write("No textual patch available from GitHub for this file.\n\n")
                     f.write(f"- Status: `{status}`\n")
 
-        separate_report_file = pr_folder / 'SeparateExtraction_Report.txt'
+        separate_report_file = output_folder / 'SeparateExtraction_Report.txt'
         with open(separate_report_file, 'w', encoding='utf-8') as f:
             f.write("# Separate Extraction Report\n")
             f.write(
@@ -882,41 +1119,48 @@ class GitHubPRParser:
         )
         print("  ✓ Saved: SeparateExtraction_Report.txt")
 
-        print(f"\n✓ All files saved to: {pr_folder}")
+        print(f"\n✓ All files saved to: {output_folder}")
 
-    def parse(self, pr_url: str):
+    def parse(self, url: str, sections: Optional[Sequence[str]] = None):
         """
-        Main method to parse a PR and generate markdown sections.
+        Main method to parse a PR or commit and generate markdown sections.
 
         Args:
-            pr_url: GitHub PR URL
+            url: GitHub PR or commit URL
+            sections: Which sections to extract (defaults to all)
         """
         try:
+            sections = list(sections) if sections else list(ALL_SECTIONS)
+
             # Parse URL
-            owner, repo, pr_number = self.parse_pr_url(pr_url)
-            print(f"Parsing PR #{pr_number} from {owner}/{repo}")
+            parsed = self.parse_url(url)
+            kind = parsed['kind']
+            subject = 'PR' if kind == 'pull' else 'commit'
+            id_display = parsed['identifier'] if kind == 'pull' else parsed['identifier'][:7]
+            print(f"Parsing {subject} {id_display} from {parsed['owner']}/{parsed['repo']}")
+            print(f"Sections: {', '.join(sections)}")
 
             # Fetch data
-            pr_data = self.fetch_pr_data(owner, repo, pr_number)
-            total_files = len(pr_data['files'])
-            total_comments = len(pr_data['comments'])
+            data = self.fetch_data(parsed)
+            total_files = len(data['files'])
+            total_comments = len(data['comments'])
             print(f"Found {total_files} files and {total_comments} comments")
 
             # Generate markdown sections
             print("Generating markdown sections...")
-            sections = self.generate_markdown_sections(pr_data)
+            generated = self.generate_markdown_sections(data, sections)
 
             # Count files included in main Description/Code outputs.
-            processed_files = len(sections.get('main_output_files', []))
+            processed_files = len(generated.get('main_output_files', []))
             print(
                 f"Processing {processed_files} files "
-                f"({len(sections['ignored_files'])} ignored, "
-                f"{len(sections.get('separate_extraction_files', []))} separately extracted)"
+                f"({len(generated['ignored_files'])} ignored, "
+                f"{len(generated.get('separate_extraction_files', []))} separately extracted)"
             )
 
             # Save to desktop in separate files
-            repo_name = f"{owner}_{repo}"
-            self.save_pr_sections(sections, pr_number, repo_name)
+            repo_name = f"{parsed['owner']}_{parsed['repo']}"
+            self.save_sections(generated, kind, parsed['identifier'], repo_name)
 
             print("\n✓ Done!")
 
@@ -925,22 +1169,64 @@ class GitHubPRParser:
             raise
 
 
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the command-line argument parser."""
+    parser = argparse.ArgumentParser(
+        prog='GitHubParser',
+        description='Extract description, code, and/or feedback from a GitHub '
+                    'pull request or commit into markdown files.',
+        epilog='Authentication: set the GITHUB_TOKEN environment variable, or enter '
+               'the token at the secure (no-echo) prompt. For security, the token is '
+               'never accepted as a command-line argument.',
+    )
+    parser.add_argument(
+        'url', nargs='?',
+        help='GitHub PR (.../pull/123) or commit (.../commit/<sha>) URL. '
+             'If omitted, you will be prompted.',
+    )
+    parser.add_argument(
+        '-s', '--sections', '--only', dest='sections', metavar='LIST',
+        help="Comma-separated sections to extract: description, code, feedback "
+             "(alias: comments=feedback), or 'all'. Example: --only feedback. "
+             "If omitted, you will be prompted (default: all).",
+    )
+    private_group = parser.add_mutually_exclusive_group()
+    private_group.add_argument(
+        '--private', dest='private', action='store_true', default=None,
+        help='Treat the repository as private (requires a token). '
+             'Skips the interactive private/public prompt.',
+    )
+    private_group.add_argument(
+        '--public', dest='private', action='store_false',
+        help='Treat the repository as public. Skips the interactive prompt.',
+    )
+    return parser
+
+
 def main():
     """Main entry point for the script."""
+    args = build_arg_parser().parse_args()
+
     print("=" * 60)
-    print("GitHub Pull Request Parser")
+    print("GitHub Parser")
     print("=" * 60)
     print()
 
-    # Check if token exists in environment
-    env_token = os.getenv('GITHUB_TOKEN')
-    token = env_token
+    # The token is only ever read from the environment or the secure prompt below,
+    # never from a command-line argument (which would leak into shell history and
+    # process listings).
+    token = os.getenv('GITHUB_TOKEN')
 
-    # Ask if the repository is private
-    is_private = input("Is this a private repository? (y/n): ").strip().lower()
+    # Determine whether the repository is private.
+    # --private/--public skip the prompt; otherwise ask interactively.
+    if args.private is None:
+        is_private_answer = input("Is this a private repository? (y/n): ").strip().lower()
+        is_private = is_private_answer in ['y', 'yes']
+    else:
+        is_private = args.private
 
-    if is_private in ['y', 'yes']:
-        if env_token:
+    if is_private:
+        if token:
             print("\n✓ Using GitHub token from GITHUB_TOKEN environment variable")
         else:
             print("\nA GitHub personal access token is required for private repositories.")
@@ -952,8 +1238,8 @@ def main():
                 return
             print("✓ Token provided")
 
-    # Initialize parser with token (loads PRIgnore.txt)
-    parser = GitHubPRParser(token=token)
+    # Initialize parser with token (loads Ignore.txt)
+    parser = GitHubParser(token=token)
 
     # Show authentication status
     print()
@@ -964,12 +1250,12 @@ def main():
 
     # Show loaded ignore patterns
     if parser.ignore_patterns:
-        print(f"\nIgnore patterns loaded from PRIgnore.txt ({len(parser.ignore_patterns)} patterns):")
+        print(f"\nIgnore patterns loaded from Ignore.txt ({len(parser.ignore_patterns)} patterns):")
         for pattern in parser.ignore_patterns:
             print(f"  - {pattern}")
     else:
-        print("\n⚠ No ignore patterns loaded (PRIgnore.txt is empty or not found)")
-        print("  Edit PRIgnore.txt in the repository to configure ignore patterns")
+        print("\n⚠ No ignore patterns loaded (Ignore.txt is empty or not found)")
+        print("  Edit Ignore.txt in the repository to configure ignore patterns")
 
     # Show loaded separate extraction patterns
     if parser.separate_extraction_patterns:
@@ -984,15 +1270,33 @@ def main():
         print("  Edit SeparateExtractionList.txt in the repository to configure patterns")
     print()
 
-    # Get PR URL from user
-    pr_url = input("Enter GitHub PR URL: ").strip()
+    # Resolve which sections to extract.
+    if args.sections is None:
+        raw_sections = input(
+            "Which sections to extract? "
+            "[all / description / code / feedback] (comma-separated, default all): "
+        ).strip()
+    else:
+        raw_sections = args.sections
 
-    if not pr_url:
+    try:
+        sections = resolve_sections(raw_sections)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return
+
+    # Get URL from user (PR or commit).
+    if args.url:
+        url = args.url.strip()
+    else:
+        url = input("\nEnter GitHub PR or commit URL: ").strip()
+
+    if not url:
         print("Error: No URL provided")
         return
 
-    # Parse the PR
-    parser.parse(pr_url)
+    # Parse the PR or commit.
+    parser.parse(url, sections=sections)
 
 
 if __name__ == '__main__':

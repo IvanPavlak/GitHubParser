@@ -1,12 +1,18 @@
-# GitHub Pull Request Parser
+# GitHub Parser
+
+Extracts information from a GitHub **pull request or commit** and formats it into
+structured markdown files. You can extract everything, or selectively pull just
+one section (for example, only the feedback/comments).
 
 ## Highlights
 
+- Works with pull requests **and** commits
 - Works with public and private repositories
+- Selective extraction: choose any of `description`, `code`, `feedback`
 - Handles paginated GitHub API responses for files and comments
-- Configurable ignore rules through `PRIgnore.txt`
+- Configurable ignore rules through `Ignore.txt`
 - Configurable extra extraction rules through `SeparateExtractionList.txt`
-- Generates a desktop output folder for the selected PR
+- Generates a desktop output folder for the selected PR or commit
 - Produces diff-style markdown for both main code output and separate extraction files
 
 ## Requirements
@@ -20,13 +26,13 @@
 ### Conda
 
 ```bash
-conda env create -f GitHubPullRequestParser.yml
-conda activate GitHubPullRequestParser
+conda env create -f GitHubParser.yml
+conda activate GitHubParser
 ```
 
 Note:
 
-- `GitHubPullRequestParser.yml` is portable and does not include a machine-specific prefix.
+- `GitHubParser.yml` is portable and does not include a machine-specific prefix.
 
 ### pip
 
@@ -36,7 +42,12 @@ python -m pip install requests==2.31.0
 
 ## Authentication
 
-For private repositories, set `GITHUB_TOKEN` before running.
+For private repositories (and to avoid low rate limits), authenticate with a token.
+For security the token is **never accepted as a command-line argument** - it would leak
+into shell history and process listings. Provide it in one of two ways:
+
+- Set the `GITHUB_TOKEN` environment variable, or
+- Enter it at the secure, no-echo prompt the script shows for a private repo.
 
 PowerShell:
 
@@ -62,63 +73,120 @@ Scopes:
 ### Recommended (cross-platform)
 
 ```bash
-python GitHubPullRequestParser.py
+python GitHubParser.py
 ```
 
-The script prompts for:
+Run with no arguments and the script prompts for:
 
 1. Whether the repository is private
-2. The PR URL
+2. Which sections to extract (default: all)
+3. The PR or commit URL
 
-Example URL:
+Example URLs:
 
 ```text
 https://github.com/owner/repo/pull/123
+https://github.com/owner/repo/commit/<sha>
 ```
+
+A commit URL may include a `#diff-<hash>` fragment (a link to a specific file on
+the page); it is ignored.
+
+### Command-line flags
+
+All prompts can be skipped with flags. Anything not provided falls back to an
+interactive prompt.
+
+```bash
+# Extract only feedback (comments) from a commit
+python GitHubParser.py --only feedback https://github.com/owner/repo/commit/<sha>
+
+# Extract code + feedback from a PR of a public repo, no prompts
+python GitHubParser.py --sections code,feedback --public https://github.com/owner/repo/pull/123
+
+# Private repo, token from the environment
+python GitHubParser.py --private --only feedback <url>
+```
+
+| Flag                         | Description                                                                                                                        |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `url` (positional)           | PR or commit URL. Prompted if omitted.                                                                                             |
+| `-s`, `--sections`, `--only` | Comma-separated: `description`, `code`, `feedback`, or `all`. Alias: `comments` = `feedback`. Prompted if omitted (default `all`). |
+| `--private` / `--public`     | Skip the private/public prompt.                                                                                                    |
+
+There is deliberately no token flag: the token comes only from `GITHUB_TOKEN` or the
+secure prompt (see [Authentication](#authentication)).
 
 ### Windows helper scripts
 
 This repository also includes:
 
-- `GitHubPullRequestParser.bat`
-- `GitHubPullRequestParser.ps1`
+- `GitHubParser.bat`
+- `GitHubParser.ps1`
 
 Important:
 
-- `GitHubPullRequestParser.bat` reads machine-specific values from `GitHubPullRequestParser.config.bat`.
-- Update `GitHubPullRequestParser.config.bat` before first use.
+- `GitHubParser.bat` reads machine-specific values from `GitHubParser.config.bat`.
+- Update `GitHubParser.config.bat` before first use.
+
+The `GitHubParser` PowerShell function exposes the same options as the Python CLI and forwards
+them through `GitHubParser.bat` to `GitHubParser.py`, so it can be driven directly from
+PowerShell in the same manner. Anything omitted falls through to the interactive prompt.
+
+```powershell
+# Interactive
+GitHubParser
+
+# Extract only feedback from a commit
+GitHubParser -Only feedback https://github.com/owner/repo/commit/<sha>
+
+# Code + feedback from a public PR, no prompts
+GitHubParser -Sections code,feedback -Public https://github.com/owner/repo/pull/123
+
+# Private repo: prompt (no echo) for a token, never placing it on the command line
+GitHubParser -Private -Token (Read-Host -AsSecureString) -Only feedback <url>
+```
+
+| Parameter              | Description                                                                                                                                                                                           |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-Url` (positional)    | PR or commit URL. Prompted if omitted.                                                                                                                                                                |
+| `-Sections` / `-Only`  | Comma-separated: `description`, `code`, `feedback`, or `all`. Alias: `comments` = `feedback`. Accepts an array (`code,feedback`).                                                                     |
+| `-Token`               | GitHub token as a **SecureString** (e.g. `(Read-Host -AsSecureString)`). Injected via the `GITHUB_TOKEN` environment variable for the child process only, then cleared - never passed as an argument. |
+| `-Private` / `-Public` | Skip the private/public prompt.                                                                                                                                                                       |
 
 ### Launcher config
 
-`GitHubPullRequestParser.config.bat` contains these editable values:
+`GitHubParser.config.bat` contains these editable values:
 
-- `conda_prefix`: full path to your conda environment, for example `C:\\Users\\your-user\\miniconda3\\envs\\GitHubPullRequestParser`
+- `conda_prefix`: full path to your conda environment, for example `C:\\Users\\your-user\\miniconda3\\envs\\GitHubParser`
 - `conda_base`: full path to your conda installation, for example `C:\\Users\\your-user\\miniconda3`
-- `python_script`: full path to `GitHubPullRequestParser.py` on your machine
+- `python_script`: full path to `GitHubParser.py` on your machine
 
 The batch launcher uses this config file to:
 
 - call `%conda_base%\\Scripts\\activate.bat` `%conda_base%`
 - run `conda activate %conda_prefix%`
-- execute `python %python_script%`
+- execute `python %python_script% %*` (any arguments passed to `GitHubParser.bat` are forwarded to the Python CLI)
 
 ## Output
 
-For PR 123 in org/repo, output is written to:
+Output is written to a folder on your desktop, named by source:
 
 ```text
-<Desktop>/PR_123_org_repo/
+<Desktop>/PR_123_org_repo/          # for a pull request
+<Desktop>/Commit_d974808_org_repo/  # for a commit (short SHA)
 ```
 
-Main files:
+Files written (only for the sections you requested):
 
-- `Description.md`
-- `Code.md`
-- `Feedback.md`
-- `PRIgnore_Report.txt`
-- `SeparateExtraction_Report.txt`
+- `Description.md` (section `description`)
+- `Code.md` (section `code`)
+- `Feedback.md` (section `feedback`)
+- `Ignore_Report.txt` (only when `description` or `code` is requested)
+- `SeparateExtraction_Report.txt` (only when `description` or `code` is requested)
 
-Additional extracted files (from SeparateExtractionList.txt) are created in the same root output folder, for example:
+Additional extracted files (from `SeparateExtractionList.txt`) are created in the
+same root output folder, for example:
 
 - `appsettings.Development.json.md`
 - `CHANGELOG.md.md`
@@ -128,7 +196,7 @@ If multiple matched files share the same source filename, a numeric suffix is ad
 
 ## Configuration
 
-### PRIgnore.txt
+### Ignore.txt
 
 Controls which files are ignored for the main parsing outputs.
 
@@ -163,10 +231,12 @@ When GitHub does not provide textual patch data for a file, the separate extract
 
 ### Feedback.md
 
-Comment snippets are extracted from diff hunks with this behavior:
+Comment snippets are extracted with this behavior:
 
+- For PR review comments, the code snippet comes from the comment's diff hunk
+- For commit comments (which have no diff hunk), the snippet comes from the file's patch using the comment line
 - Exact selected range when start_line and line are available
-- Otherwise line with surrounding context
+- Otherwise the line with surrounding context
 - Tail fallback when line metadata is unavailable
 
 ## Troubleshooting
@@ -176,14 +246,14 @@ Comment snippets are extracted from diff hunks with this behavior:
 Common causes:
 
 - private repository without token
-- incorrect PR URL
+- incorrect PR/commit URL
 - missing repository access
 
 ### Missing files in output
 
-- Check `PRIgnore_Report.txt` for ignored files
+- Check `Ignore_Report.txt` for ignored files
 - Check `SeparateExtraction_Report.txt` for files matched by `SeparateExtractionList.txt`
-- Verify patterns in `PRIgnore.txt` and `SeparateExtractionList.txt`
+- Verify patterns in `Ignore.txt` and `SeparateExtractionList.txt`
 
 ### Rate limit issues
 
@@ -191,13 +261,13 @@ Unauthenticated GitHub API usage is limited. Set `GITHUB_TOKEN` to increase limi
 
 ## Repository files
 
-- `GitHubPullRequestParser.py`: main parser
-- `PRIgnore.txt`: ignore rules
+- `GitHubParser.py`: main parser
+- `Ignore.txt`: ignore rules
 - `SeparateExtractionList.txt`: rules for extra extracted markdown files
 - `LICENSE`: MIT License
-- `GitHubPullRequestParser.yml`: conda environment spec
-- `GitHubPullRequestParser.bat`: batch launcher (path-dependent)
-- `GitHubPullRequestParser.ps1`: PowerShell wrapper (path-dependent)
+- `GitHubParser.yml`: conda environment spec
+- `GitHubParser.bat`: batch launcher (path-dependent)
+- `GitHubParser.ps1`: PowerShell wrapper (path-dependent)
 
 ## License
 
