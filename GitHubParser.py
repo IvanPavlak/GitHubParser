@@ -719,6 +719,65 @@ class GitHubParser:
         start_idx = max(0, len(all_lines) - 11)
         return all_lines[start_idx:]
 
+    def _extract_context_by_position(self, patch: str, position: int,
+                                     context: int = 5) -> List[str]:
+        """
+        Extract a window of new-file code around a GitHub diff *position*.
+
+        Commit comments (unlike PR review comments) carry no diff_hunk and are
+        anchored by ``position`` — the 1-based index of the commented line within
+        the file's unified diff, counting every line after the first ``@@`` hunk
+        header (later ``@@`` headers included). This maps that position back to
+        the surrounding code on the new-file side.
+
+        Args:
+            patch: The file's unified-diff patch (as returned by the GitHub API).
+            position: The comment's diff position (GitHub 'position' field).
+            context: Number of visible lines to include above and below the anchor.
+
+        Returns:
+            List of code lines around the anchored position (removed lines and
+            hunk headers are omitted from the rendered snippet).
+        """
+        if not patch or not position:
+            return []
+
+        patch = patch.replace('\r\n', '\n').replace('\r', '\n')
+        lines = patch.split('\n')
+
+        # Walk the diff, tracking each line's GitHub position. Positions start at
+        # 1 on the first line after the first hunk header and increment for every
+        # subsequent line (removed lines and later '@@' headers included).
+        visible = []  # (position, code_text) for lines present on the new-file side
+        pos = 0
+        seen_hunk = False
+        for line in lines:
+            if not seen_hunk:
+                if line.startswith('@@'):
+                    seen_hunk = True
+                continue
+            pos += 1
+            if line.startswith('+') and not line.startswith('+++'):
+                visible.append((pos, line[1:]))
+            elif line.startswith(' '):
+                visible.append((pos, line[1:]))
+            # Removed ('-') lines and later '@@' headers consume a position but
+            # are not part of the new-file snippet, so they are skipped here.
+
+        if not visible:
+            return []
+
+        # Anchor on the exact position if it is a visible line; otherwise fall
+        # back to the closest visible line (e.g. a comment on a removed line).
+        anchor_idx = next((i for i, (p, _) in enumerate(visible) if p == position), None)
+        if anchor_idx is None:
+            anchor_idx = min(range(len(visible)),
+                             key=lambda i: abs(visible[i][0] - position))
+
+        lo = max(0, anchor_idx - context)
+        hi = min(len(visible), anchor_idx + context + 1)
+        return [code for _, code in visible[lo:hi]]
+
     def format_comments(self, comments: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, str]]]:
         """
         Group and format comments by file.
@@ -845,29 +904,37 @@ class GitHubParser:
 
             # Show code context for this thread.
             first_comment = thread_comments[0]
-            comment_line = first_comment.get('line', 0) or 0
-            start_line = first_comment.get('start_line') or None
+            extension = self.get_file_extension(filepath)
+            context_lines = []
 
-            # Prefer the diff_hunk (PR review comments); fall back to the file's
-            # full patch (commit comments have no diff_hunk).
-            source_patch = first_comment['code']
-            if not source_patch and filepath != 'General':
-                file_data = files_by_path.get(filepath)
-                if file_data:
-                    source_patch = file_data.get('patch', '')
-
-            if source_patch:
-                extension = self.get_file_extension(filepath)
+            if first_comment['code']:
+                # PR review comment: the diff_hunk is the comment-time snapshot,
+                # anchored by line / start_line.
+                comment_line = first_comment.get('line', 0) or 0
+                start_line = first_comment.get('start_line') or None
                 context_lines = self.extract_comment_context(
-                    source_patch,
+                    first_comment['code'],
                     comment_line=comment_line,
                     start_line=start_line,
                 )
+            elif filepath != 'General':
+                # Commit comment: no diff_hunk. GitHub anchors it by `position`
+                # (an index into the file's diff); the `line` field is often
+                # absent. Source the snippet from the file's full patch.
+                file_data = files_by_path.get(filepath)
+                full_patch = file_data.get('patch', '') if file_data else ''
+                if full_patch:
+                    position = first_comment.get('position') or 0
+                    comment_line = first_comment.get('line', 0) or 0
+                    if position:
+                        context_lines = self._extract_context_by_position(full_patch, position)
+                    elif comment_line:
+                        context_lines = self._extract_lines_with_context(full_patch, comment_line)
 
-                if context_lines:
-                    feedback_md += f"```{extension}\n"
-                    feedback_md += '\n'.join(context_lines)
-                    feedback_md += "\n```\n\n"
+            if context_lines:
+                feedback_md += f"```{extension}\n"
+                feedback_md += '\n'.join(context_lines)
+                feedback_md += "\n```\n\n"
 
             # Format comments based on thread size.
             if len(thread_comments) == 1:
