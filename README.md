@@ -231,7 +231,16 @@ When GitHub does not provide textual patch data for a file, the separate extract
 
 ### Feedback.md
 
-Comment snippets are extracted with this behavior:
+All feedback on a pull request is captured, not just inline code notes:
+
+- Inline review comments (anchored to a diff line)
+- Conversation-tab comments (general discussion, not attached to code)
+- Review summaries (the message submitted with an Approve / Comment / Request-changes review)
+
+Comments not attached to a file are grouped under a `General` heading. For a commit,
+both file-level and general commit comments are captured the same way.
+
+Code snippets for anchored comments are extracted with this behavior:
 
 - For PR review comments, the code snippet comes from the comment's diff hunk
 - For commit comments (which have no diff hunk), the snippet comes from the file's patch using the comment line

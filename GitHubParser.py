@@ -342,6 +342,13 @@ class GitHubParser:
         """
         Fetch PR data from GitHub API with pagination support.
 
+        Captures every kind of PR comment so feedback is not limited to inline
+        code notes:
+          * inline review comments  (/pulls/{n}/comments)  – anchored to a diff line
+          * conversation comments   (/issues/{n}/comments) – general timeline, no code
+          * review summary bodies   (/pulls/{n}/reviews)    – the message submitted with
+                                                              an Approve/Comment/Request-changes review
+
         Args:
             owner: Repository owner
             repo: Repository name
@@ -351,6 +358,7 @@ class GitHubParser:
             Unified data dict for the pull request
         """
         base_url = f'https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}'
+        issue_url = f'https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}'
 
         print(f"Fetching PR data from {base_url}...")
 
@@ -365,9 +373,26 @@ class GitHubParser:
         print("\nFetching changed files...")
         files_data = self.fetch_paginated(f'{base_url}/files', 'files')
 
-        # Fetch review comments (with pagination)
-        print("\nFetching review comments...")
-        comments_data = self.fetch_paginated(f'{base_url}/comments', 'comments')
+        # A PR carries three separate comment streams. Previously only the
+        # inline one was fetched, so any feedback left in the Conversation tab
+        # or as a review summary was silently dropped.
+        print("\nFetching inline review comments...")
+        review_comments = self.fetch_paginated(f'{base_url}/comments', 'comments')
+
+        print("\nFetching conversation comments...")
+        issue_comments = self.fetch_paginated(f'{issue_url}/comments', 'comments')
+
+        print("\nFetching review summaries...")
+        reviews = self.fetch_paginated(f'{base_url}/reviews', 'reviews')
+        # Keep only reviews that carry an actual message; a bare approval or a
+        # review that merely bundles inline notes has an empty body and would
+        # otherwise render as a blank entry.
+        review_summaries = [r for r in reviews if (r.get('body') or '').strip()]
+
+        # Inline comments keep their file/diff anchoring; conversation comments
+        # and review summaries have no `path`, so format_comments() files them
+        # under the "General" section automatically.
+        comments_data = review_comments + issue_comments + review_summaries
 
         return {
             'kind': 'pull',
