@@ -8,7 +8,7 @@ one section (for example, only the feedback/comments).
 
 - Works with pull requests **and** commits
 - Works with public and private repositories
-- Selective extraction: choose any of `description`, `code`, `feedback`
+- Selective extraction: choose any of `code`, `feedback`
 - Handles paginated GitHub API responses for files and comments
 - Configurable ignore rules through `Ignore.txt`
 - Configurable extra extraction rules through `SeparateExtractionList.txt`
@@ -108,11 +108,11 @@ python GitHubParser.py --sections code,feedback --public https://github.com/owne
 python GitHubParser.py --private --only feedback <url>
 ```
 
-| Flag                         | Description                                                                                                                        |
-| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `url` (positional)           | PR or commit URL. Prompted if omitted.                                                                                             |
-| `-s`, `--sections`, `--only` | Comma-separated: `description`, `code`, `feedback`, or `all`. Alias: `comments` = `feedback`. Prompted if omitted (default `all`). |
-| `--private` / `--public`     | Skip the private/public prompt.                                                                                                    |
+| Flag                         | Description                                                                                                         |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `url` (positional)           | PR or commit URL. Prompted if omitted.                                                                              |
+| `-s`, `--sections`, `--only` | Comma-separated: `code`, `feedback`, or `all`. Alias: `comments` = `feedback`. Prompted if omitted (default `all`). |
+| `--private` / `--public`     | Skip the private/public prompt.                                                                                     |
 
 There is deliberately no token flag: the token comes only from `GITHUB_TOKEN` or the
 secure prompt (see [Authentication](#authentication)).
@@ -150,7 +150,7 @@ GitHubParser -Private -Token (Read-Host -AsSecureString) -Only feedback <url>
 | Parameter              | Description                                                                                                                                                                                           |
 | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `-Url` (positional)    | PR or commit URL. Prompted if omitted.                                                                                                                                                                |
-| `-Sections` / `-Only`  | Comma-separated: `description`, `code`, `feedback`, or `all`. Alias: `comments` = `feedback`. Accepts an array (`code,feedback`).                                                                     |
+| `-Sections` / `-Only`  | Comma-separated: `code`, `feedback`, or `all`. Alias: `comments` = `feedback`. Accepts an array (`code,feedback`).                                                                                    |
 | `-Token`               | GitHub token as a **SecureString** (e.g. `(Read-Host -AsSecureString)`). Injected via the `GITHUB_TOKEN` environment variable for the child process only, then cleared - never passed as an argument. |
 | `-Private` / `-Public` | Skip the private/public prompt.                                                                                                                                                                       |
 
@@ -179,11 +179,10 @@ Output is written to a folder on your desktop, named by source:
 
 Files written (only for the sections you requested):
 
-- `Description.md` (section `description`)
 - `Code.md` (section `code`)
 - `Feedback.md` (section `feedback`)
-- `Ignore_Report.txt` (only when `description` or `code` is requested)
-- `SeparateExtraction_Report.txt` (only when `description` or `code` is requested)
+- `Ignore_Report.txt` (only when `code` is requested)
+- `SeparateExtraction_Report.txt` (only when `code` is requested)
 
 Additional extracted files (from `SeparateExtractionList.txt`) are created in the
 same root output folder, for example:
@@ -211,7 +210,7 @@ Pattern behavior:
 
 Controls which changed files get standalone markdown diff files in the output root.
 
-Files that match these patterns are excluded from main outputs (`Description.md` and `Code.md`) so they appear only in their dedicated extracted files.
+Files that match these patterns are excluded from the main output (`Code.md`) so they appear only in their dedicated extracted files.
 
 Current starter patterns include:
 

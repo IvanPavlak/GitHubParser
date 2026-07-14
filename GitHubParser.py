@@ -4,7 +4,7 @@ GitHub Parser
 Extracts information from a GitHub pull request or commit and formats it into
 structured markdown files.
 
-Supports selective extraction of sections (description, code, feedback) so you
+Supports selective extraction of sections (code, feedback) so you
 can, for example, pull only the feedback/comments for a commit.
 """
 
@@ -20,13 +20,11 @@ from fnmatch import fnmatch
 
 
 # Canonical output sections and friendly aliases.
-ALL_SECTIONS = ['description', 'code', 'feedback']
+ALL_SECTIONS = ['code', 'feedback']
 SECTION_ALIASES = {
     'comments': 'feedback',
     'comment': 'feedback',
     'feedbacks': 'feedback',
-    'desc': 'description',
-    'descriptions': 'description',
 }
 
 
@@ -842,17 +840,6 @@ class GitHubParser:
 
         return comments_by_file
 
-    def _build_description_md(self, files_by_category: Dict[str, List[Dict[str, Any]]]) -> str:
-        """Build the Description.md content from categorized files."""
-        description_md = "# Description\n\n"
-        for category in sorted(files_by_category.keys()):
-            description_md += f"## {category}\n\n"
-            for file_data in files_by_category[category]:
-                filepath = file_data['filename']
-                description_md += f"### `{filepath}`\n\n"
-                description_md += "- Description\n\n"
-        return description_md
-
     def _build_code_md(self, files_by_category: Dict[str, List[Dict[str, Any]]]) -> str:
         """Build the Code.md content from categorized files."""
         code_md = "# Code\n\n"
@@ -1015,7 +1002,7 @@ class GitHubParser:
         Args:
             data: Unified data dict from :meth:`fetch_data`
             sections: Which sections to generate. Any subset of
-                ``description``, ``code``, ``feedback``. Defaults to all.
+                ``code``, ``feedback``. Defaults to all.
 
         Returns:
             Dictionary containing the requested markdown sections plus file
@@ -1031,14 +1018,14 @@ class GitHubParser:
             f for f in all_files if self.should_extract_separately(f['filename'])
         ]
 
-        # Files matched for separate extraction are excluded from main outputs
-        # (Description.md and Code.md) and are represented via standalone files.
+        # Files matched for separate extraction are excluded from the main
+        # output (Code.md) and are represented via standalone files.
         files = [
             f for f in all_files
             if not self.should_ignore(f['filename']) and not self.should_extract_separately(f['filename'])
         ]
 
-        # Group files by category (used by description + code).
+        # Group files by category (used by code).
         files_by_category = {}
         for file_data in files:
             category = self.categorize_file(file_data['filename'])
@@ -1054,8 +1041,6 @@ class GitHubParser:
             'main_output_files': [f['filename'] for f in files],
         }
 
-        if 'description' in sections:
-            result['description'] = self._build_description_md(files_by_category)
         if 'code' in sections:
             result['code'] = self._build_code_md(files_by_category)
         if 'feedback' in sections:
@@ -1078,7 +1063,7 @@ class GitHubParser:
 
         Only the sections that were requested are written. The ignore/separate
         extraction reports and standalone extraction files are written only when
-        a file-based section (description or code) was requested.
+        the file-based code section was requested.
 
         Args:
             sections: Dictionary from :meth:`generate_markdown_sections`
@@ -1087,7 +1072,7 @@ class GitHubParser:
             repo_name: Repository name (owner_repo)
         """
         requested = sections.get('sections', list(ALL_SECTIONS))
-        file_sections_requested = 'description' in requested or 'code' in requested
+        file_sections_requested = 'code' in requested
 
         desktop = Path.home() / 'Desktop'
         folder_name = self._output_folder_name(kind, identifier, repo_name)
@@ -1096,13 +1081,6 @@ class GitHubParser:
         # Create folder
         output_folder.mkdir(exist_ok=True)
         print(f"\nCreating output folder: {output_folder}")
-
-        # Save Description.md
-        if 'description' in sections:
-            desc_file = output_folder / 'Description.md'
-            with open(desc_file, 'w', encoding='utf-8') as f:
-                f.write(sections['description'])
-            print("  ✓ Saved: Description.md")
 
         # Save Code.md
         if 'code' in sections:
@@ -1242,7 +1220,7 @@ class GitHubParser:
             print("Generating markdown sections...")
             generated = self.generate_markdown_sections(data, sections)
 
-            # Count files included in main Description/Code outputs.
+            # Count files included in the main Code output.
             processed_files = len(generated.get('main_output_files', []))
             print(
                 f"Processing {processed_files} files "
@@ -1265,7 +1243,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Build the command-line argument parser."""
     parser = argparse.ArgumentParser(
         prog='GitHubParser',
-        description='Extract description, code, and/or feedback from a GitHub '
+        description='Extract code and/or feedback from a GitHub '
                     'pull request or commit into markdown files.',
         epilog='Authentication: set the GITHUB_TOKEN environment variable, or enter '
                'the token at the secure (no-echo) prompt. For security, the token is '
@@ -1278,7 +1256,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '-s', '--sections', '--only', dest='sections', metavar='LIST',
-        help="Comma-separated sections to extract: description, code, feedback "
+        help="Comma-separated sections to extract: code, feedback "
              "(alias: comments=feedback), or 'all'. Example: --only feedback. "
              "If omitted, you will be prompted (default: all).",
     )
@@ -1366,7 +1344,7 @@ def main():
     if args.sections is None:
         raw_sections = input(
             "Which sections to extract? "
-            "[all / description / code / feedback] (comma-separated, default all): "
+            "[all / code / feedback] (comma-separated, default all): "
         ).strip()
     else:
         raw_sections = args.sections

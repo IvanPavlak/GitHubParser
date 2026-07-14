@@ -26,7 +26,7 @@ function GitHubParser {
 		`#diff-...` fragment is ignored. Prompted if omitted.
 
 	.PARAMETER Sections
-		Comma-separated sections to extract: `description`, `code`, `feedback` (alias:
+		Comma-separated sections to extract: `code`, `feedback` (alias:
 		`comments` = `feedback`), or `all`. Also accepts `-Only`. Prompted if omitted (default: all).
 
 	.PARAMETER Token
