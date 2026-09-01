@@ -8,6 +8,6 @@
 # Starters
 *appsettings*.json
 **/appsettings*.json
-*CHANGELOG*.md
-**/*CHANGELOG*.md
+*.md
+**/*.md
 **/*.csproj
