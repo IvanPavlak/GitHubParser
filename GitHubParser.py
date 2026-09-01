@@ -481,11 +481,25 @@ class GitHubParser:
         status = file_data.get('status', '')
         patch = file_data.get('patch', '')
 
+        # Markdown sources are emitted as plain markdown: no code fence, and
+        # headings instead of comment markers, so the extracted file still
+        # renders as a document instead of a wall of escaped source.
+        is_markdown = os.path.splitext(filepath)[1].lower() == '.md'
+        fence_open = '' if is_markdown else f"```{extension}\n"
+        fence_close = '' if is_markdown else "```\n"
+        old_marker = '#### Old' if is_markdown else '// Old'
+        new_marker = '#### New' if is_markdown else '// New'
+
         # Check if file was deleted
         if status == 'removed':
+            if is_markdown:
+                return self._format_markdown_changes(
+                    filepath, patch, removed_file=True
+                )
+
             output = f"### `{filepath}`\n\n"
-            output += f"```{extension}\n"
-            output += "// Old\n...\n"
+            output += fence_open
+            output += f"{old_marker}\n...\n"
 
             # Extract the old code from the patch
             if patch:
@@ -505,14 +519,21 @@ class GitHubParser:
                     output += '\n'.join(old_code)
                     output += "\n...\n"
 
-            output += "\n// New\n...\n"
+            output += f"\n{new_marker}\n...\n"
             output += "FILE REMOVED\n"
             output += "...\n"
-            output += "```\n\n"
+            output += fence_close + "\n"
             return output
 
         if not patch:
             return ''
+
+        # Markdown reports only the lines that actually changed, one Old/New
+        # pair per change: whole-file Old and New blocks drift hundreds of
+        # lines apart, and their context lines are identical on both sides,
+        # which buries the edit in text that did not change.
+        if is_markdown:
+            return self._format_markdown_changes(filepath, patch)
 
         # Parse the patch to extract old and new code sections
         # Normalize line endings (handle both \r\n and \n)
@@ -557,7 +578,7 @@ class GitHubParser:
 
         # Format output
         output = f"### `{filepath}`\n\n"
-        output += f"```{extension}\n"
+        output += fence_open
 
         # If only additions (new file or new code only)
         if not old_sections and new_sections:
@@ -568,15 +589,129 @@ class GitHubParser:
             output += '\n...\n'.join(formatted_sections)
         else:
             # Show old and new sections
-            output += "// Old\n...\n"
+            output += f"{old_marker}\n...\n"
             # Join old sections with ... separator
             output += '\n...\n'.join(old_sections)
-            output += "\n...\n\n// New\n...\n"
+            output += f"\n...\n\n{new_marker}\n...\n"
             # Join new sections with ... separator
             output += '\n...\n'.join(new_sections)
             output += "\n..."
 
-        output += "\n```\n\n"
+        output += "\n" + fence_close + "\n"
+
+        return output
+
+    def _split_patch_changes(self, patch: str) -> List[Dict[str, Any]]:
+        """
+        Split a unified-diff patch into contiguous change groups.
+
+        A group is a run of removed and/or added lines with no context line in
+        between, so a '-' run followed by a '+' run is one group: a
+        replacement. Context lines are read only to keep the line counter
+        honest and are never collected.
+
+        Args:
+            patch: A unified-diff patch string
+
+        Returns:
+            List of dicts with the removed lines, the added lines, and the
+            old- and new-file line numbers the group starts at.
+        """
+        patch = patch.replace('\r\n', '\n').replace('\r', '\n')
+        changes: List[Dict[str, Any]] = []
+        current: Optional[Dict[str, Any]] = None
+        old_line = 1
+        new_line = 1
+
+        for line in patch.split('\n'):
+            if line.startswith('@@'):
+                header = re.match(
+                    r'@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@', line
+                )
+                if header:
+                    old_line = int(header.group(1))
+                    new_line = int(header.group(2))
+                else:
+                    old_line = 1
+                    new_line = 1
+                current = None
+                continue
+
+            # Blank context lines arrive as a single space; a truly empty line
+            # is patch padding and carries no content.
+            if not line:
+                continue
+
+            is_removal = line.startswith('-') and not line.startswith('---')
+            is_addition = line.startswith('+') and not line.startswith('+++')
+
+            if is_removal or is_addition:
+                if current is None:
+                    current = {
+                        'removed': [],
+                        'added': [],
+                        'old_anchor': old_line,
+                        'new_anchor': new_line,
+                    }
+                    changes.append(current)
+                if is_removal:
+                    current['removed'].append(line[1:])
+                    old_line += 1
+                else:
+                    current['added'].append(line[1:])
+                    new_line += 1
+            else:
+                # Context line: closes the current group and advances both
+                # file positions.
+                current = None
+                old_line += 1
+                new_line += 1
+
+        return changes
+
+    def _format_markdown_changes(self, filepath: str, patch: str,
+                                 removed_file: bool = False) -> str:
+        """
+        Format a markdown file's diff as the changed lines only.
+
+        Every removed line is collected under one Old section and every added
+        line under one New section, listed under the line number of the change
+        they belong to. A section with nothing to report is left out entirely,
+        so a pure addition has no Old section and a deletion has no New one.
+
+        Args:
+            filepath: Path of the markdown file
+            patch: A unified-diff patch string
+            removed_file: True when the whole file was deleted
+
+        Returns:
+            Formatted markdown string, unfenced
+        """
+        changes = self._split_patch_changes(patch)
+        if not changes:
+            return ''
+
+        output = f"### `{filepath}`\n\n"
+        if removed_file:
+            output += "**File removed.**\n\n"
+
+        sides = (
+            ('Old', 'removed', 'old_anchor'),
+            ('New', 'added', 'new_anchor'),
+        )
+
+        for heading, side, anchor_key in sides:
+            groups = [change for change in changes if change[side]]
+            if not groups:
+                continue
+
+            output += f"#### {heading}\n\n"
+            for group in groups:
+                output += f"* line {group[anchor_key]}\n"
+                for text in group[side]:
+                    # Blank lines are real changes but invisible as a bullet.
+                    output += f"   * {text.rstrip() or '(blank line)'}\n"
+            output += "\n"
 
         return output
 
