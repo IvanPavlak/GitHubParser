@@ -1,51 +1,67 @@
-# Ignore.txt - Patterns for files to ignore when parsing a PR or commit
-# Similar to .gitignore, one pattern per line
-# Supports wildcard matching using glob patterns
+# Ignore.txt - Files to leave out when parsing a PR or commit
+# Ignored files are left out of Code.md and are not extracted separately.
+# Review comments on them still appear in Feedback.md.
 #
-# Examples:
-#   **/Migrations/*           - Ignore all files in any Migrations folder
-#   **/*.min.js               - Ignore all minified JavaScript files
-#   **/test/*                 - Ignore all test directories
-#   **/dist/*                 - Ignore distribution folders
-#   specific/path/file.txt    - Ignore a specific file
-#
-# Lines starting with # are comments and will be ignored
+# One glob pattern per line; lines starting with # are comments.
+# '*' matches across folders, a leading '**/' also matches at the repository root,
+# '!pattern' re-includes a file, and the last matching line wins.
 
-# Database Migrations
+# Lock files
+**/package-lock.json
+**/yarn.lock
+**/pnpm-lock.yaml
+**/poetry.lock
+**/Pipfile.lock
+**/Cargo.lock
+**/go.sum
+**/composer.lock
+**/Gemfile.lock
+**/packages.lock.json
+
+# Generated code
 **/Migrations/*
 **/migrations/*
-
-# Minified Files
-**/*.min.js
-**/*.min.css
-
-# Dependencies
-**/node_modules/*
-**/package-lock.json
-**/package.json
-**/yarn.lock
-
-# Build Artifacts
-# **/dist/*
-# **/build/*
-
-# Test Files
-# **/test/*
-# **/*.test.js
-# **/*.spec.ts
-
-# Documentation (uncomment if you want to ignore)
-**/*.md
-# **/docs/*
-
-# Translations and appsettings
-**/*.json
-
-# Project files
-**/*.csproj
-
-# Frontend Types
+**/*.Designer.cs
+**/*.g.cs
+**/*.generated.*
+**/*ModelSnapshot.cs
+**/*.pb.go
+**/__snapshots__/*
+**/*.snap
+# Project-specific generated files, for example a generated API client:
 **/src/types.ts
 
-# Docs
-**.xml
+# Build output and bundles
+**/*.min.js
+**/*.min.css
+**/*.map
+**/dist/*
+**/build/*
+**/bin/*
+**/obj/*
+**/out/*
+
+# Vendored code
+**/node_modules/*
+**/vendor/*
+
+# Binaries and assets (GitHub sends no text diff for most of these)
+**/*.png
+**/*.jpg
+**/*.jpeg
+**/*.gif
+**/*.ico
+**/*.svg
+**/*.webp
+**/*.woff
+**/*.woff2
+**/*.ttf
+**/*.eot
+**/*.pdf
+**/*.zip
+# Translations
+**/Translations/*.json
+**/translations/*.json
+**/locales/*
+**/i18n/*
+**/*.resx

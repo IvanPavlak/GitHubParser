@@ -10,10 +10,11 @@ can, for example, pull only the feedback/comments for a commit.
 
 import os
 import re
-import sys
 import getpass
 import argparse
+import difflib
 import requests
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import List, Dict, Any, Optional, Sequence
 from fnmatch import fnmatch
@@ -26,6 +27,30 @@ SECTION_ALIASES = {
     'comment': 'feedback',
     'feedbacks': 'feedback',
 }
+
+# Seconds to wait for GitHub before giving up; without a timeout a stalled
+# connection hangs the run forever.
+REQUEST_TIMEOUT = 30
+
+# Markdown diff layout (see GitHubParser._format_markdown_changes).
+MARKDOWN_CONTEXT_LINES = 1      # unchanged lines shown around each change
+MARKDOWN_CONTEXT_WIDTH = 120    # context lines are cut to this many characters
+WORD_DIFF_KEEP_WORDS = 6        # unchanged words kept on each side of an in-line edit
+WORD_DIFF_MIN_SIMILARITY = 0.5  # less similar replaced lines are shown as '-' and '+'
+DUPLICATE_MIN_LENGTH = 20       # shorter added lines are never flagged as duplicates
+
+TOKEN_PATTERN = re.compile(r'\s+|\w+|[^\w\s]')
+TABLE_DELIMITER_PATTERN = re.compile(r'^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?$')
+
+# Review states shown in Feedback.md. A verdict is shown even without a
+# message; a plain "Commented" review only when it carries one.
+REVIEW_STATE_LABELS = {
+    'APPROVED': 'Approved',
+    'CHANGES_REQUESTED': 'Changes requested',
+    'DISMISSED': 'Dismissed',
+    'COMMENTED': 'Commented',
+}
+REVIEW_VERDICT_STATES = ('APPROVED', 'CHANGES_REQUESTED', 'DISMISSED')
 
 
 def resolve_sections(raw: Optional[str]) -> List[str]:
@@ -67,7 +92,8 @@ def resolve_sections(raw: Optional[str]) -> List[str]:
 
 class GitHubParser:
     def __init__(self, token: Optional[str] = None, ignore_path: Optional[str] = None,
-                 separate_extraction_list_path: Optional[str] = None):
+                 separate_extraction_list_path: Optional[str] = None,
+                 categories_path: Optional[str] = None):
         """
         Initialize the parser with an optional GitHub token.
 
@@ -76,6 +102,7 @@ class GitHubParser:
             ignore_path: Path to Ignore.txt file. If None, looks in script directory.
             separate_extraction_list_path: Path to SeparateExtractionList.txt file.
                 If None, looks in script directory.
+            categories_path: Path to Categories.txt file. If None, looks in script directory.
         """
         self.token = token or os.getenv('GITHUB_TOKEN')
         self.headers = {
@@ -97,10 +124,19 @@ class GitHubParser:
         else:
             separate_extraction_list_path = Path(separate_extraction_list_path)
 
+        if categories_path is None:
+            categories_path = script_dir / 'Categories.txt'
+        else:
+            categories_path = Path(categories_path)
+
         self.ignore_patterns = self.load_patterns_file(ignore_path, 'Ignore.txt')
-        self.separate_extraction_patterns = self.load_patterns_file(
-            separate_extraction_list_path,
-            'SeparateExtractionList.txt'
+        # (group, pattern) pairs; the group names the output subfolder.
+        self.separate_extraction_rules = self.load_grouped_patterns_file(
+            separate_extraction_list_path, 'SeparateExtractionList.txt', default_group='Other'
+        )
+        # (category, pattern) pairs deciding the Code.md sections.
+        self.category_rules = self.load_grouped_patterns_file(
+            categories_path, 'Categories.txt', default_group='Other'
         )
 
     def load_patterns_file(self, patterns_path: Path, list_name: str) -> List[str]:
@@ -136,9 +172,67 @@ class GitHubParser:
 
         return patterns
 
-    def load_ignore_patterns(self, ignore_path: Path) -> List[str]:
-        """Backward-compatible wrapper for loading Ignore.txt."""
-        return self.load_patterns_file(ignore_path, 'Ignore.txt')
+    def load_grouped_patterns_file(self, patterns_path: Path, list_name: str,
+                                   default_group: str) -> List[tuple]:
+        """
+        Load glob patterns grouped under [Section] headers.
+
+        A line like ``[Config]`` starts a group; the patterns below it belong
+        to that group until the next header. Patterns before any header belong
+        to ``default_group``.
+
+        Args:
+            patterns_path: Path to patterns file
+            list_name: Display name used in log messages
+            default_group: Group for patterns that precede every header
+
+        Returns:
+            List of (group, pattern) tuples in file order
+        """
+        rules = []
+        if not patterns_path.exists():
+            print(f"Warning: {list_name} not found at {patterns_path}")
+            print(f"Using empty pattern list. Create {list_name} to configure patterns.")
+            return rules
+
+        group = default_group
+        try:
+            with open(patterns_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    header = re.fullmatch(r'\[(.+)\]', line)
+                    if header:
+                        group = header.group(1).strip()
+                    else:
+                        rules.append((group, line))
+            print(f"Loaded {len(rules)} pattern(s) from {list_name}")
+        except Exception as e:
+            print(f"Error reading {list_name}: {e}")
+            print("Continuing with empty pattern list.")
+        return rules
+
+    def match_group(self, filepath: str, rules: List[tuple]) -> Optional[str]:
+        """
+        Find the group of the last (group, pattern) rule matching a path, with
+        the same pattern syntax as :meth:`matches_patterns`. A matching
+        '!pattern' clears the match. Returns None when nothing matches.
+        """
+        matched = None
+        for group, pattern in rules:
+            is_negation = pattern.startswith('!')
+            if self.matches_patterns(filepath, [pattern[1:] if is_negation else pattern]):
+                matched = None if is_negation else group
+        return matched
+
+    @staticmethod
+    def _normalize_path(path: str) -> str:
+        """Use forward slashes and drop a leading './' (a prefix, not a set of characters)."""
+        path = path.replace('\\', '/')
+        while path.startswith('./'):
+            path = path[2:]
+        return path
 
     def matches_patterns(self, filepath: str, patterns: List[str]) -> bool:
         """
@@ -146,23 +240,23 @@ class GitHubParser:
 
         Supports optional negation via leading '!'.
         Last matching pattern wins.
+
+        '*' matches across folders (fnmatch semantics). As in .gitignore, a
+        leading '**/' also matches at the repository root, so '**/*.md'
+        matches 'CHANGELOG.md' as well as 'docs/setup.md'.
         """
-        normalized_filepath = filepath.replace('\\', '/').lstrip('./')
+        normalized_filepath = self._normalize_path(filepath)
         matched = False
 
         for pattern in patterns:
             is_negation = pattern.startswith('!')
-            actual_pattern = pattern[1:] if is_negation else pattern
+            actual_pattern = self._normalize_path(pattern[1:] if is_negation else pattern)
 
-            # Normalize slashes so patterns work regardless of separator style.
-            normalized_pattern = actual_pattern.replace('\\', '/').lstrip('./')
+            candidates = [actual_pattern]
+            if actual_pattern.startswith('**/'):
+                candidates.append(actual_pattern[3:])
 
-            is_match = (
-                fnmatch(filepath, actual_pattern) or
-                fnmatch(normalized_filepath, normalized_pattern)
-            )
-
-            if is_match:
+            if any(fnmatch(normalized_filepath, candidate) for candidate in candidates):
                 matched = not is_negation
 
         return matched
@@ -214,17 +308,24 @@ class GitHubParser:
         """
         return self.matches_patterns(filepath, self.ignore_patterns)
 
+    def extraction_group(self, filepath: str) -> Optional[str]:
+        """
+        Output subfolder for a separately extracted file (the [Section] of its
+        last matching rule in SeparateExtractionList.txt), or None. Ignored
+        files are never extracted.
+        """
+        if self.should_ignore(filepath):
+            return None
+        return self.match_group(filepath, self.separate_extraction_rules)
+
     def should_extract_separately(self, filepath: str) -> bool:
         """Check if a file should be separately extracted based on patterns."""
-        return self.matches_patterns(filepath, self.separate_extraction_patterns)
-
-    def add_ignore_patterns(self, patterns: List[str]):
-        """Add custom ignore patterns."""
-        self.ignore_patterns.extend(patterns)
+        return self.extraction_group(filepath) is not None
 
     def categorize_file(self, filepath: str) -> str:
         """
-        Categorize file as Backend, Frontend, or Other based on path.
+        Categorize a file for Code.md using Categories.txt: the [Section] of
+        the last matching pattern, or 'Other' when none matches.
 
         Args:
             filepath: Path to the file
@@ -232,13 +333,7 @@ class GitHubParser:
         Returns:
             Category name
         """
-        if filepath.startswith('api/') or filepath.endswith(('.cs', '.java', '.py', '.go')):
-            return 'Backend'
-        elif filepath.startswith('ui/') or filepath.startswith('frontend/') or \
-             filepath.endswith(('.ts', '.tsx', '.jsx', '.vue')):
-            return 'Frontend'
-        else:
-            return 'Other'
+        return self.match_group(filepath, self.category_rules) or 'Other'
 
     def get_file_extension(self, filepath: str) -> str:
         """Get the code block extension for markdown."""
@@ -261,6 +356,38 @@ class GitHubParser:
         ext = os.path.splitext(filepath)[1]
         return ext_map.get(ext, '')
 
+    def _get(self, url: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+        """
+        GET a GitHub API URL with a timeout, turning a rate-limit refusal into
+        a readable error instead of a bare HTTPError.
+
+        Args:
+            url: The API endpoint URL
+            params: Optional query parameters
+
+        Returns:
+            The response; its status is left for the caller to check, so a
+            404 can still get its own message.
+        """
+        response = requests.get(url, headers=self.headers, params=params, timeout=REQUEST_TIMEOUT)
+
+        if response.status_code in (403, 429):
+            if response.headers.get('X-RateLimit-Remaining') == '0':
+                reset = response.headers.get('X-RateLimit-Reset', '')
+                when = (f"at {datetime.fromtimestamp(int(reset)):%H:%M}" if reset.isdigit()
+                        else "within the hour")
+                hint = '' if self.token else (
+                    " Set GITHUB_TOKEN to raise the limit from 60 to 5,000 requests per hour."
+                )
+                raise RuntimeError(f"GitHub API rate limit reached; it resets {when}.{hint}")
+            if 'Retry-After' in response.headers:
+                raise RuntimeError(
+                    f"GitHub API secondary rate limit reached; retry in "
+                    f"{response.headers['Retry-After']} seconds."
+                )
+
+        return response
+
     def fetch_paginated(self, url: str, resource_name: str) -> List[Dict[str, Any]]:
         """
         Fetch all pages of a paginated GitHub API endpoint that returns a JSON array.
@@ -278,7 +405,7 @@ class GitHubParser:
 
         while True:
             params = {'per_page': per_page, 'page': page}
-            response = requests.get(url, headers=self.headers, params=params)
+            response = self._get(url, params=params)
             response.raise_for_status()
 
             items = response.json()
@@ -326,7 +453,8 @@ class GitHubParser:
             parsed: Result of :meth:`parse_url`
 
         Returns:
-            Unified dict: {kind, owner, repo, identifier, meta, files, comments}
+            Unified dict: {kind, owner, repo, identifier, meta, files,
+            comments (anchored to a file), conversation (not anchored), reviews}
         """
         if parsed['kind'] == 'pull':
             return self.fetch_pull_data(
@@ -344,8 +472,8 @@ class GitHubParser:
         code notes:
           * inline review comments  (/pulls/{n}/comments)  – anchored to a diff line
           * conversation comments   (/issues/{n}/comments) – general timeline, no code
-          * review summary bodies   (/pulls/{n}/reviews)    – the message submitted with
-                                                              an Approve/Comment/Request-changes review
+          * reviews                 (/pulls/{n}/reviews)    – the Approve/Comment/Request-changes
+                                                              verdict and its optional summary
 
         Args:
             owner: Repository owner
@@ -361,7 +489,7 @@ class GitHubParser:
         print(f"Fetching PR data from {base_url}...")
 
         # Fetch PR details
-        pr_response = requests.get(base_url, headers=self.headers)
+        pr_response = self._get(base_url)
         if pr_response.status_code == 404:
             self._handle_not_found('pull')
         pr_response.raise_for_status()
@@ -371,26 +499,17 @@ class GitHubParser:
         print("\nFetching changed files...")
         files_data = self.fetch_paginated(f'{base_url}/files', 'files')
 
-        # A PR carries three separate comment streams. Previously only the
-        # inline one was fetched, so any feedback left in the Conversation tab
-        # or as a review summary was silently dropped.
+        # A PR carries three separate comment streams. They stay apart so
+        # Feedback.md can show review verdicts (including approvals that come
+        # without a message) separately from the comments.
         print("\nFetching inline review comments...")
         review_comments = self.fetch_paginated(f'{base_url}/comments', 'comments')
 
         print("\nFetching conversation comments...")
         issue_comments = self.fetch_paginated(f'{issue_url}/comments', 'comments')
 
-        print("\nFetching review summaries...")
+        print("\nFetching reviews...")
         reviews = self.fetch_paginated(f'{base_url}/reviews', 'reviews')
-        # Keep only reviews that carry an actual message; a bare approval or a
-        # review that merely bundles inline notes has an empty body and would
-        # otherwise render as a blank entry.
-        review_summaries = [r for r in reviews if (r.get('body') or '').strip()]
-
-        # Inline comments keep their file/diff anchoring; conversation comments
-        # and review summaries have no `path`, so format_comments() files them
-        # under the "General" section automatically.
-        comments_data = review_comments + issue_comments + review_summaries
 
         return {
             'kind': 'pull',
@@ -399,7 +518,9 @@ class GitHubParser:
             'identifier': pr_number,
             'meta': pr_data,
             'files': files_data,
-            'comments': comments_data,
+            'comments': review_comments,
+            'conversation': issue_comments,
+            'reviews': reviews,
         }
 
     def fetch_commit_data(self, owner: str, repo: str, sha: str) -> Dict[str, Any]:
@@ -423,9 +544,7 @@ class GitHubParser:
         print(f"Fetching commit data from {base_url}...")
 
         # Fetch commit details (page 1 carries the metadata + first slice of files)
-        commit_response = requests.get(
-            base_url, headers=self.headers, params={'per_page': 100, 'page': 1}
-        )
+        commit_response = self._get(base_url, params={'per_page': 100, 'page': 1})
         if commit_response.status_code == 404:
             self._handle_not_found('commit')
         commit_response.raise_for_status()
@@ -439,9 +558,7 @@ class GitHubParser:
         if len(files_data) == 100:
             page = 2
             while True:
-                response = requests.get(
-                    base_url, headers=self.headers, params={'per_page': 100, 'page': page}
-                )
+                response = self._get(base_url, params={'per_page': 100, 'page': page})
                 response.raise_for_status()
                 page_files = response.json().get('files', []) or []
                 if not page_files:
@@ -456,6 +573,7 @@ class GitHubParser:
         print("\nFetching commit comments...")
         comments_data = self.fetch_paginated(f'{base_url}/comments', 'comments')
 
+        # A commit comment without a path is about the commit as a whole.
         return {
             'kind': 'commit',
             'owner': owner,
@@ -463,7 +581,9 @@ class GitHubParser:
             'identifier': sha,
             'meta': commit_data,
             'files': files_data,
-            'comments': comments_data,
+            'comments': [c for c in comments_data if c.get('path')],
+            'conversation': [c for c in comments_data if not c.get('path')],
+            'reviews': [],
         }
 
     def format_code_changes(self, file_data: Dict[str, Any]) -> str:
@@ -481,59 +601,43 @@ class GitHubParser:
         status = file_data.get('status', '')
         patch = file_data.get('patch', '')
 
-        # Markdown sources are emitted as plain markdown: no code fence, and
-        # headings instead of comment markers, so the extracted file still
-        # renders as a document instead of a wall of escaped source.
-        is_markdown = os.path.splitext(filepath)[1].lower() == '.md'
-        fence_open = '' if is_markdown else f"```{extension}\n"
-        fence_close = '' if is_markdown else "```\n"
-        old_marker = '#### Old' if is_markdown else '// Old'
-        new_marker = '#### New' if is_markdown else '// New'
+        # GitHub sends no patch for binary files, very large diffs and renames
+        # without changes; keep the file visible with a note instead.
+        if not patch:
+            return self._format_no_patch(file_data)
+
+        # Markdown is prose, not code: it gets a diff layout of its own.
+        if os.path.splitext(filepath)[1].lower() == '.md':
+            return self._format_markdown_changes(file_data)
 
         # Check if file was deleted
         if status == 'removed':
-            if is_markdown:
-                return self._format_markdown_changes(
-                    filepath, patch, removed_file=True
-                )
-
             output = f"### `{filepath}`\n\n"
-            output += fence_open
-            output += f"{old_marker}\n...\n"
+            output += f"```{extension}\n"
+            output += "// Old\n...\n"
 
             # Extract the old code from the patch
-            if patch:
-                patch_normalized = patch.replace('\r\n', '\n').replace('\r', '\n')
-                lines = patch_normalized.split('\n')
-                old_code = []
-                for line in lines:
-                    if not line:
-                        continue
-                    if line.startswith('@@') or line.startswith('+++') or line.startswith('---'):
-                        continue
-                    # For removed files, all lines are either context (space) or removed (-)
-                    if line and line[0] in [' ', '-']:
-                        old_code.append(line[1:])
+            patch_normalized = patch.replace('\r\n', '\n').replace('\r', '\n')
+            lines = patch_normalized.split('\n')
+            old_code = []
+            for line in lines:
+                if not line:
+                    continue
+                if line.startswith('@@') or line.startswith('+++') or line.startswith('---'):
+                    continue
+                # For removed files, all lines are either context (space) or removed (-)
+                if line and line[0] in [' ', '-']:
+                    old_code.append(line[1:])
 
-                if old_code:
-                    output += '\n'.join(old_code)
-                    output += "\n...\n"
+            if old_code:
+                output += '\n'.join(old_code)
+                output += "\n...\n"
 
-            output += f"\n{new_marker}\n...\n"
+            output += "\n// New\n...\n"
             output += "FILE REMOVED\n"
             output += "...\n"
-            output += fence_close + "\n"
+            output += "```\n\n"
             return output
-
-        if not patch:
-            return ''
-
-        # Markdown reports only the lines that actually changed, one Old/New
-        # pair per change: whole-file Old and New blocks drift hundreds of
-        # lines apart, and their context lines are identical on both sides,
-        # which buries the edit in text that did not change.
-        if is_markdown:
-            return self._format_markdown_changes(filepath, patch)
 
         # Parse the patch to extract old and new code sections
         # Normalize line endings (handle both \r\n and \n)
@@ -578,7 +682,7 @@ class GitHubParser:
 
         # Format output
         output = f"### `{filepath}`\n\n"
-        output += fence_open
+        output += f"```{extension}\n"
 
         # If only additions (new file or new code only)
         if not old_sections and new_sections:
@@ -589,131 +693,451 @@ class GitHubParser:
             output += '\n...\n'.join(formatted_sections)
         else:
             # Show old and new sections
-            output += f"{old_marker}\n...\n"
+            output += "// Old\n...\n"
             # Join old sections with ... separator
             output += '\n...\n'.join(old_sections)
-            output += f"\n...\n\n{new_marker}\n...\n"
+            output += "\n...\n\n// New\n...\n"
             # Join new sections with ... separator
             output += '\n...\n'.join(new_sections)
             output += "\n..."
 
-        output += "\n" + fence_close + "\n"
+        output += "\n```\n\n"
 
         return output
 
-    def _split_patch_changes(self, patch: str) -> List[Dict[str, Any]]:
+    def _format_no_patch(self, file_data: Dict[str, Any]) -> str:
         """
-        Split a unified-diff patch into contiguous change groups.
+        Format a file GitHub sent no textual patch for: its header and a note.
 
-        A group is a run of removed and/or added lines with no context line in
-        between, so a '-' run followed by a '+' run is one group: a
-        replacement. Context lines are read only to keep the line counter
-        honest and are never collected.
+        Args:
+            file_data: File change data from GitHub API
+
+        Returns:
+            Formatted markdown string
+        """
+        details = [file_data.get('status') or 'changed']
+        if file_data.get('previous_filename'):
+            details.append(f"from `{file_data['previous_filename']}`")
+        additions = file_data.get('additions', 0)
+        deletions = file_data.get('deletions', 0)
+        if additions or deletions:
+            details.append(f"+{additions:,} -{deletions:,}")
+
+        return (
+            f"### `{file_data['filename']}`\n\n"
+            f"_No textual diff from GitHub (binary, too large, or renamed without "
+            f"changes) · {' · '.join(details)}._\n\n"
+        )
+
+    def _format_markdown_changes(self, file_data: Dict[str, Any]) -> str:
+        """
+        Format a markdown file's diff for reading.
+
+        A new file is shown as the document itself. Otherwise each change is
+        a ```diff block with one line of context around it: '+' added, '-'
+        removed, and '!' for a line edited in place, where [-old-]{+new+}
+        marks the edited words and '…' stands for unchanged text left out.
+        These docs keep a paragraph on one line, so printing an edited line
+        twice would bury a one-word change in thousands of characters.
+        Changes that only touch whitespace (re-padded tables, re-indented
+        lists) are left out and listed in one note, and an added line
+        identical to its neighbour is flagged as a possible duplicate.
+
+        Args:
+            file_data: File change data from GitHub API, with a patch
+
+        Returns:
+            Formatted markdown string
+        """
+        filepath = file_data['filename']
+        status = file_data.get('status', '')
+        rows = self._parse_patch_rows(file_data.get('patch', ''))
+        output = f"### `{filepath}`\n\n"
+
+        if status == 'added':
+            content = '\n'.join(row['text'] for row in rows if row['kind'] == '+').rstrip()
+            output += f"_New file · {file_data.get('additions', 0):,} lines, shown as-is below._\n\n"
+            return output + "---\n\n" + content + "\n\n---\n"
+
+        if status == 'removed':
+            removed = [row['text'].rstrip() for row in rows if row['kind'] == '-']
+            fence = self._code_fence(removed)
+            output += f"_File removed · {len(removed):,} lines._\n\n"
+            return output + f"{fence}diff\n" + ''.join(f"-{text}\n" for text in removed) + f"{fence}\n\n"
+
+        display = self._markdown_display_rows(rows)
+        hunks = self._markdown_hunks(display)
+        reformatted = [row['new'] for row in display if row['kind'] == 'ws']
+
+        if hunks:
+            counts = [(sum(row['kind'] == kind for row in display), label)
+                      for kind, label in (('+', 'added'), ('edit', 'edited'), ('-', 'removed'))]
+            summary = ' · '.join(f"{count} {label}" for count, label in counts if count)
+            output += f"_{len(hunks)} change{'s' if len(hunks) != 1 else ''} · {summary} lines_\n\n"
+        else:
+            output += "_Only whitespace changed._\n\n"
+        if reformatted:
+            output += (f"_Whitespace-only re-format hidden ({len(reformatted)} lines): "
+                       f"{self._line_ranges(reformatted)}._\n\n")
+
+        for hunk in hunks:
+            fence = self._code_fence(row.get(key, '') for row in hunk for key in ('text', 'before', 'after'))
+            output += f"#### {self._markdown_hunk_label(hunk)}\n\n{fence}diff\n"
+            for row in hunk:
+                if row['kind'] == 'edit':
+                    output += '!' + self._word_diff(row['before'], row['after']).rstrip() + '\n'
+                elif row['kind'] in ('-', '+'):
+                    output += row['kind'] + row['text'].rstrip() + '\n'
+                else:
+                    output += ' ' + self._clip_context(row['text']) + '\n'
+            output += f"{fence}\n\n"
+            for line, neighbour in self._duplicate_warnings(hunk):
+                output += (f"> ⚠ Line {line} is identical to line {neighbour} "
+                           f"(possible accidental duplicate).\n\n")
+
+        return output
+
+    def _parse_patch_rows(self, patch: str) -> List[Dict[str, Any]]:
+        """
+        Parse a unified-diff patch into rows.
+
+        Each row has a 'kind' (' ' context, '-' removed, '+' added, '@' hunk
+        break), the old- and new-file line numbers at that point ('old',
+        'new') and the line's 'text'. A removed row's 'new' is where the line
+        used to sit in the new file, and an added row's 'old' likewise.
 
         Args:
             patch: A unified-diff patch string
 
         Returns:
-            List of dicts with the removed lines, the added lines, and the
-            old- and new-file line numbers the group starts at.
+            List of row dicts in patch order
         """
-        patch = patch.replace('\r\n', '\n').replace('\r', '\n')
-        changes: List[Dict[str, Any]] = []
-        current: Optional[Dict[str, Any]] = None
-        old_line = 1
-        new_line = 1
+        rows: List[Dict[str, Any]] = []
+        old_line = new_line = 1
 
-        for line in patch.split('\n'):
+        for line in patch.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
             if line.startswith('@@'):
-                header = re.match(
-                    r'@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@', line
-                )
-                if header:
-                    old_line = int(header.group(1))
-                    new_line = int(header.group(2))
-                else:
-                    old_line = 1
-                    new_line = 1
-                current = None
+                header = re.match(r'@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@', line)
+                old_line, new_line = (int(header.group(1)), int(header.group(2))) if header else (1, 1)
+                rows.append({'kind': '@'})
                 continue
 
             # Blank context lines arrive as a single space; a truly empty line
-            # is patch padding and carries no content.
-            if not line:
+            # is patch padding, and '\' starts "\ No newline at end of file".
+            if not line or line.startswith('\\'):
                 continue
 
-            is_removal = line.startswith('-') and not line.startswith('---')
-            is_addition = line.startswith('+') and not line.startswith('+++')
-
-            if is_removal or is_addition:
-                if current is None:
-                    current = {
-                        'removed': [],
-                        'added': [],
-                        'old_anchor': old_line,
-                        'new_anchor': new_line,
-                    }
-                    changes.append(current)
-                if is_removal:
-                    current['removed'].append(line[1:])
-                    old_line += 1
-                else:
-                    current['added'].append(line[1:])
-                    new_line += 1
-            else:
-                # Context line: closes the current group and advances both
-                # file positions.
-                current = None
+            kind = line[0] if line[0] in '+-' else ' '
+            rows.append({'kind': kind, 'old': old_line, 'new': new_line, 'text': line[1:]})
+            if kind != '+':
                 old_line += 1
+            if kind != '-':
                 new_line += 1
 
-        return changes
+        return rows
 
-    def _format_markdown_changes(self, filepath: str, patch: str,
-                                 removed_file: bool = False) -> str:
+    def _markdown_display_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Format a markdown file's diff as the changed lines only.
+        Classify the changed lines of a markdown patch for display.
 
-        Every removed line is collected under one Old section and every added
-        line under one New section, listed under the line number of the change
-        they belong to. A section with nothing to report is left out entirely,
-        so a pure addition has no Old section and a deletion has no New one.
+        Within each run of removed/added lines, lines that only changed in
+        whitespace become 'ws' rows (shown as context, listed in a note),
+        similar replaced lines become 'edit' rows (rendered as a word diff)
+        and the rest stay removals and additions.
 
         Args:
-            filepath: Path of the markdown file
-            patch: A unified-diff patch string
-            removed_file: True when the whole file was deleted
+            rows: Rows from _parse_patch_rows
 
         Returns:
-            Formatted markdown string, unfenced
+            The rows with every run of changes replaced by its classified rows
         """
-        changes = self._split_patch_changes(patch)
-        if not changes:
-            return ''
+        display: List[Dict[str, Any]] = []
+        index = 0
 
-        output = f"### `{filepath}`\n\n"
-        if removed_file:
-            output += "**File removed.**\n\n"
-
-        sides = (
-            ('Old', 'removed', 'old_anchor'),
-            ('New', 'added', 'new_anchor'),
-        )
-
-        for heading, side, anchor_key in sides:
-            groups = [change for change in changes if change[side]]
-            if not groups:
+        while index < len(rows):
+            if rows[index]['kind'] not in ('-', '+'):
+                display.append(rows[index])
+                index += 1
                 continue
 
-            output += f"#### {heading}\n\n"
-            for group in groups:
-                output += f"* line {group[anchor_key]}\n"
-                for text in group[side]:
-                    # Blank lines are real changes but invisible as a bullet.
-                    output += f"   * {text.rstrip() or '(blank line)'}\n"
-            output += "\n"
+            end = index
+            while end < len(rows) and rows[end]['kind'] in ('-', '+'):
+                end += 1
+            removed = [row for row in rows[index:end] if row['kind'] == '-']
+            added = [row for row in rows[index:end] if row['kind'] == '+']
+            index = end
 
-        return output
+            # Re-flowed JSON or a re-wrapped paragraph: same text, new line breaks.
+            if removed and added and self._same_ignoring_whitespace(removed, added):
+                display.extend({**row, 'kind': 'ws'} for row in added)
+                continue
+
+            matcher = difflib.SequenceMatcher(
+                None,
+                [self._normalize_markdown_line(row['text']) for row in removed],
+                [self._normalize_markdown_line(row['text']) for row in added],
+                autojunk=False,
+            )
+            for op, i1, i2, j1, j2 in matcher.get_opcodes():
+                if op == 'equal':
+                    display.extend({**row, 'kind': 'ws'} for row in added[j1:j2])
+                elif op == 'delete':
+                    display.extend(removed[i1:i2])
+                elif op == 'insert':
+                    display.extend(added[j1:j2])
+                else:
+                    for kind, old_row, new_row in self._pair_similar_lines(removed[i1:i2], added[j1:j2]):
+                        if kind == 'edit':
+                            display.append({
+                                'kind': 'edit', 'old': old_row['old'], 'new': new_row['new'],
+                                'before': old_row['text'], 'after': new_row['text'],
+                            })
+                        else:
+                            display.append(old_row if kind == '-' else new_row)
+
+        return display
+
+    def _normalize_markdown_line(self, text: str) -> str:
+        """
+        Whitespace-insensitive form of a markdown line, used to recognise
+        changes that only re-pad a table or re-indent a list. Table delimiter
+        rows ('|---|:--:|') are reduced to their alignment, because re-padding
+        changes how many dashes they have.
+        """
+        stripped = text.strip()
+        if '-' in stripped and '|' in stripped and TABLE_DELIMITER_PATTERN.match(stripped):
+            cells = [cell.strip() for cell in stripped.strip('|').split('|')]
+            return '|' + '|'.join(
+                (':' if cell.startswith(':') else '') + '---'
+                + (':' if cell.endswith(':') and len(cell) > 1 else '')
+                for cell in cells
+            ) + '|'
+        return re.sub(r'\s+', ' ', stripped)
+
+    def _same_ignoring_whitespace(self, removed: List[Dict[str, Any]],
+                                  added: List[Dict[str, Any]]) -> bool:
+        """True when two runs of lines differ only in whitespace, line breaks included."""
+        def squash(rows):
+            return re.sub(r'\s+', '', ''.join(self._normalize_markdown_line(row['text']) for row in rows))
+        return squash(removed) == squash(added)
+
+    def _pair_similar_lines(self, removed: List[Dict[str, Any]],
+                            added: List[Dict[str, Any]]) -> List[tuple]:
+        """
+        Pair replaced lines with their edited versions the way difflib's
+        Differ does: take the most similar removed/added pair, then repeat on
+        the lines before and after it. A line without a partner that is more
+        than WORD_DIFF_MIN_SIMILARITY alike stays a plain removal or addition.
+
+        Args:
+            removed: Removed rows of one replacement
+            added: Added rows of the same replacement
+
+        Returns:
+            ('edit', removed_row, added_row), ('-', removed_row, None) and
+            ('+', None, added_row) tuples in file order
+        """
+        if not removed:
+            return [('+', None, row) for row in added]
+        if not added:
+            return [('-', row, None) for row in removed]
+
+        best, best_i, best_j = WORD_DIFF_MIN_SIMILARITY, -1, -1
+        removed_tokens = [TOKEN_PATTERN.findall(row['text']) for row in removed]
+        matcher = difflib.SequenceMatcher(autojunk=False)
+        for j, added_row in enumerate(added):
+            matcher.set_seq2(TOKEN_PATTERN.findall(added_row['text']))
+            for i, tokens in enumerate(removed_tokens):
+                matcher.set_seq1(tokens)
+                if matcher.real_quick_ratio() <= best or matcher.quick_ratio() <= best:
+                    continue
+                ratio = matcher.ratio()
+                if ratio > best:
+                    best, best_i, best_j = ratio, i, j
+
+        if best_i < 0:
+            return [('-', row, None) for row in removed] + [('+', None, row) for row in added]
+        return (
+            self._pair_similar_lines(removed[:best_i], added[:best_j])
+            + [('edit', removed[best_i], added[best_j])]
+            + self._pair_similar_lines(removed[best_i + 1:], added[best_j + 1:])
+        )
+
+    def _word_diff(self, before: str, after: str) -> str:
+        """
+        Render an edited line as one line with [-removed-]{+added+} markers,
+        shortening unchanged stretches to the words around each change.
+
+        Args:
+            before: The line as it was
+            after: The line as it is now
+
+        Returns:
+            The marked-up line
+        """
+        old_tokens = TOKEN_PATTERN.findall(before)
+        new_tokens = TOKEN_PATTERN.findall(after)
+        matcher = difflib.SequenceMatcher(None, old_tokens, new_tokens, autojunk=False)
+        segments = [
+            [op, ''.join(old_tokens[i1:i2]), ''.join(new_tokens[j1:j2])]
+            for op, i1, i2, j1, j2 in matcher.get_opcodes()
+        ]
+
+        # Fold a tiny unchanged island (a space, a single word) between two
+        # changes into them, so the result reads as phrases, not confetti.
+        index = 1
+        while index < len(segments) - 1:
+            segment = segments[index]
+            if (segment[0] == 'equal'
+                    and segments[index - 1][0] != 'equal' and segments[index + 1][0] != 'equal'
+                    and len([t for t in TOKEN_PATTERN.findall(segment[1]) if not t.isspace()]) <= 1):
+                previous, following = segments[index - 1], segments[index + 1]
+                segments[index - 1:index + 2] = [[
+                    'replace',
+                    previous[1] + segment[1] + following[1],
+                    previous[2] + segment[2] + following[2],
+                ]]
+            else:
+                index += 1
+
+        output = []
+        last = len(segments) - 1
+        for index, (op, old, new) in enumerate(segments):
+            if op == 'equal':
+                if last == 0:
+                    output.append(old)
+                else:
+                    output.append(self._trim_unchanged(
+                        old, 'end' if index == 0 else 'start' if index == last else 'both'))
+                continue
+
+            # A change of spacing alone is noise next to real edits.
+            if not old.strip() and not new.strip():
+                output.append(new)
+                continue
+
+            # Whitespace shared by both sides stays outside the markers:
+            # "{+word+} " rather than "{+word +}".
+            sides = [text for text in (old, new) if text]
+            lead = os.path.commonprefix([re.match(r'\s*', text).group(0) for text in sides])
+            trail = os.path.commonprefix(
+                [re.search(r'\s*$', text[len(lead):]).group(0)[::-1] for text in sides]
+            )[::-1]
+            old_core = old[len(lead):len(old) - len(trail)] if old else ''
+            new_core = new[len(lead):len(new) - len(trail)] if new else ''
+            output.append(
+                lead
+                + (f"[-{old_core}-]" if old_core else '')
+                + (f"{{+{new_core}+}}" if new_core else '')
+                + trail
+            )
+
+        return ''.join(output)
+
+    def _trim_unchanged(self, text: str, keep: str) -> str:
+        """
+        Shorten an unchanged stretch of an edited line to the words next to
+        the change: keep='end' for a stretch that starts the line, 'start'
+        for one that ends it, and 'both' for one between two changes.
+        """
+        tokens = TOKEN_PATTERN.findall(text)
+        words = [i for i, token in enumerate(tokens) if re.match(r'\w', token)]
+        count = WORD_DIFF_KEEP_WORDS
+
+        if keep == 'end':
+            if len(words) <= count:
+                return text
+            return '… ' + ''.join(tokens[words[-count]:]).lstrip()
+        if keep == 'start':
+            if len(words) <= count:
+                return text
+            return ''.join(tokens[:words[count - 1] + 1]).rstrip() + ' …'
+        if len(words) <= 2 * count:
+            return text
+        return (''.join(tokens[:words[count - 1] + 1]).rstrip() + ' … '
+                + ''.join(tokens[words[-count]:]).lstrip())
+
+    def _markdown_hunks(self, rows: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        """
+        Group display rows into hunks: each change with MARKDOWN_CONTEXT_LINES
+        unchanged rows on either side, merging changes whose context touches.
+        """
+        windows: List[List[int]] = []
+        for index, row in enumerate(rows):
+            if row['kind'] not in ('-', '+', 'edit'):
+                continue
+            low = high = index
+            for _ in range(MARKDOWN_CONTEXT_LINES):
+                if low > 0 and rows[low - 1]['kind'] in (' ', 'ws'):
+                    low -= 1
+                if high + 1 < len(rows) and rows[high + 1]['kind'] in (' ', 'ws'):
+                    high += 1
+            if windows and low <= windows[-1][1] + 1:
+                windows[-1][1] = max(windows[-1][1], high)
+            else:
+                windows.append([low, high])
+        return [rows[low:high + 1] for low, high in windows]
+
+    def _markdown_hunk_label(self, hunk: List[Dict[str, Any]]) -> str:
+        """Heading for a hunk: the new-file lines it adds or edits, else the old lines it removes."""
+        new_lines = [row['new'] for row in hunk if row['kind'] in ('+', 'edit')]
+        if new_lines:
+            first, last = min(new_lines), max(new_lines)
+            return f"Line {first}" if first == last else f"Lines {first}–{last}"
+        old_lines = [row['old'] for row in hunk if row['kind'] == '-']
+        first, last = min(old_lines), max(old_lines)
+        return f"Removed old line {first}" if first == last else f"Removed old lines {first}–{last}"
+
+    def _duplicate_warnings(self, hunk: List[Dict[str, Any]]) -> List[tuple]:
+        """
+        Find added lines identical to the line right above or below them in
+        the new file, usually an accident such as a merge that kept both sides.
+
+        Returns:
+            (added line number, identical neighbour's line number) tuples
+        """
+        new_side = [row for row in hunk if row['kind'] in (' ', 'ws', '+', 'edit')]
+        warnings = []
+        for index, row in enumerate(new_side):
+            if row['kind'] != '+' or len(row['text'].strip()) < DUPLICATE_MIN_LENGTH:
+                continue
+            text = self._normalize_markdown_line(row['text'])
+            for neighbour in (index - 1, index + 1):
+                if 0 <= neighbour < len(new_side):
+                    other = new_side[neighbour]
+                    other_text = other['after'] if other['kind'] == 'edit' else other['text']
+                    if self._normalize_markdown_line(other_text) == text:
+                        warnings.append((row['new'], other['new']))
+                        break
+        return warnings
+
+    def _clip_context(self, text: str) -> str:
+        """Cut a context line to MARKDOWN_CONTEXT_WIDTH characters; it only shows where a change sits."""
+        text = text.rstrip()
+        if len(text) <= MARKDOWN_CONTEXT_WIDTH:
+            return text
+        return text[:MARKDOWN_CONTEXT_WIDTH - 2].rstrip() + ' …'
+
+    @staticmethod
+    def _code_fence(texts) -> str:
+        """A backtick fence longer than any fence inside the fenced lines (docs embed ``` blocks)."""
+        longest = 2
+        for text in texts:
+            run = re.match(r'\s*(`{3,})', text)
+            if run:
+                longest = max(longest, len(run.group(1)))
+        return '`' * (longest + 1)
+
+    @staticmethod
+    def _line_ranges(numbers: List[int]) -> str:
+        """Compress line numbers into ranges: [8, 9, 10, 13] -> '8–10, 13'."""
+        ranges: List[List[int]] = []
+        for number in sorted(set(numbers)):
+            if ranges and number == ranges[-1][1] + 1:
+                ranges[-1][1] = number
+            else:
+                ranges.append([number, number])
+        return ', '.join(f"{first}" if first == last else f"{first}–{last}" for first, last in ranges)
 
     def _build_new_line_map(self, patch: str) -> List[tuple]:
         """
@@ -753,22 +1177,6 @@ class GitHubParser:
                 current_new_line += 1
 
         return new_line_map
-
-    def _extract_lines_by_range(self, full_patch: str, start_line: int, end_line: int) -> List[str]:
-        """
-        Extract exact lines from *start_line* to *end_line* (inclusive) using
-        the new-file side of a patch.
-
-        Args:
-            full_patch: The complete file patch
-            start_line: First line number to include
-            end_line: Last line number to include
-
-        Returns:
-            List of code lines in the requested range
-        """
-        line_map = self._build_new_line_map(full_patch)
-        return [code for num, code in line_map if start_line <= num <= end_line]
 
     def _extract_lines_with_context(self, full_patch: str, anchor_line: int,
                                     context: int = 5) -> List[str]:
@@ -831,8 +1239,9 @@ class GitHubParser:
 
         Args:
             diff_hunk: The diff hunk ending at the commented line (comment-time snapshot)
-            comment_line: Line number in the new file (GitHub 'line' field)
-            start_line: First line of a multi-line selection (GitHub 'start_line')
+            comment_line: Line number in the new file at the commented commit
+                (GitHub 'original_line', which matches the diff_hunk)
+            start_line: First line of a multi-line selection (GitHub 'original_start_line')
 
         Returns:
             List of code lines representing the relevant snippet
@@ -936,44 +1345,39 @@ class GitHubParser:
         hi = min(len(visible), anchor_idx + context + 1)
         return [code for _, code in visible[lo:hi]]
 
-    def format_comments(self, comments: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, str]]]:
+    def _line_for_position(self, patch: str, position: int) -> Optional[int]:
         """
-        Group and format comments by file.
-
-        Handles both PR review comments (which carry diff_hunk / reply threading)
-        and commit comments (which do not). Missing fields degrade gracefully via
-        ``.get()`` defaults.
+        Map a GitHub diff position (counted as in _extract_context_by_position)
+        to the new-file line it points at.
 
         Args:
-            comments: List of comment data from GitHub API
+            patch: The file's unified-diff patch
+            position: The comment's diff position
 
         Returns:
-            Dictionary mapping filepath to list of comment data
+            The new-file line number, or None when the position lands on a
+            removed line or a hunk header, or lies outside the patch
         """
-        comments_by_file = {}
-
-        for comment in comments:
-            filepath = comment.get('path') or 'General'
-
-            if filepath not in comments_by_file:
-                comments_by_file[filepath] = []
-
-            comments_by_file[filepath].append({
-                'author': (comment.get('user') or {}).get('login', 'unknown'),
-                'body': comment.get('body', ''),
-                'code': comment.get('diff_hunk', ''),
-                'position': comment.get('position', 0),
-                'id': comment.get('id'),
-                'in_reply_to_id': comment.get('in_reply_to_id'),
-                'line': comment.get('line', 0),
-                'original_line': comment.get('original_line', 0),
-                'start_line': comment.get('start_line'),
-                'original_start_line': comment.get('original_start_line'),
-                'side': comment.get('side'),
-                'start_side': comment.get('start_side'),
-            })
-
-        return comments_by_file
+        new_line = 0
+        pos = 0
+        seen_hunk = False
+        for line in patch.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
+            header = re.match(r'@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@', line)
+            if not seen_hunk:
+                if header:
+                    seen_hunk = True
+                    new_line = int(header.group(1))
+                continue
+            pos += 1
+            if header:
+                new_line = int(header.group(1))
+            elif line.startswith('+') or line.startswith(' '):
+                if pos == position:
+                    return new_line
+                new_line += 1
+            if pos >= position:
+                return None
+        return None
 
     def _build_code_md(self, files_by_category: Dict[str, List[Dict[str, Any]]]) -> str:
         """Build the Code.md content from categorized files."""
@@ -984,150 +1388,215 @@ class GitHubParser:
                 code_md += self.format_code_changes(file_data)
         return code_md
 
-    def _build_feedback_md(self, comments: List[Dict[str, Any]],
-                           files_by_path: Dict[str, Dict[str, Any]]) -> str:
+    def _build_feedback_md(self, data: Dict[str, Any], files_by_path: Dict[str, Dict[str, Any]],
+                           separate_names: Dict[str, str], with_code: bool) -> str:
         """
-        Build the Feedback.md content from comments.
+        Build the Feedback.md content.
 
-        Code context for a comment is sourced from the comment's diff_hunk
-        (PR review comments). When no diff_hunk is present (commit comments),
-        it falls back to the file's full patch using the comment's line number.
+        Every review, conversation comment and inline comment is included,
+        whether or not its file matches Ignore.txt: the ignore list decides
+        what goes into Code.md, not which feedback is worth reading.
+
+        Review verdicts and their summaries come first, then conversation
+        comments, then inline comment threads grouped by file in Code.md
+        order and sorted by line.
+
+        Args:
+            data: Unified data dict from :meth:`fetch_data`
+            files_by_path: Every changed file, keyed by path
+            separate_names: Output file name of each separately extracted file
+            with_code: True when Code.md and the separate files are written in
+                the same run, so comments can say where their file's diff is
+
+        Returns:
+            Feedback.md content
         """
-        feedback_md = "# Feedback\n\n"
-        comments_by_file = self.format_comments(comments)
+        blocks = []
 
-        if not comments_by_file:
-            feedback_md += "No comments found.\n"
-            return feedback_md
+        reviews = [
+            review for review in data.get('reviews', [])
+            if review.get('state') in REVIEW_VERDICT_STATES
+            or (review.get('state') == 'COMMENTED' and (review.get('body') or '').strip())
+        ]
+        if reviews:
+            block = "## Reviews\n\n"
+            for review in reviews:
+                label = REVIEW_STATE_LABELS.get(review['state'], review['state'])
+                date = (review.get('submitted_at') or '')[:10]
+                body = (review.get('body') or '').strip()
+                block += f"- `{self._author(review)}` · **{label}**" + (f" · {date}" if date else '')
+                block += (f" →{self._format_comment_body(body)}" if body else '') + "\n\n"
+            blocks.append(block)
 
-        # First, build conversation threads based on reply chains.
-        all_threads = []
-        for filepath, file_comments in comments_by_file.items():
-            if filepath != 'General' and self.should_ignore(filepath):
-                continue
+        if data.get('conversation'):
+            block = "## Conversation\n\n"
+            for comment in data['conversation']:
+                date = (comment.get('created_at') or '')[:10]
+                block += (f"- `{self._author(comment)}`" + (f" · {date}" if date else '')
+                          + f" →{self._format_comment_body(comment.get('body'))}\n\n")
+            blocks.append(block)
 
-            # Find root comments (not replies to other comments).
-            root_comments = [c for c in file_comments if not c['in_reply_to_id']]
+        if data.get('comments'):
+            blocks.append("## Comments\n\n" + self._format_comment_threads(
+                data['comments'], files_by_path, separate_names, with_code))
 
-            # Build threads: each root comment + all its replies.
-            for root_comment in root_comments:
-                thread = [root_comment]
+        return "# Feedback\n\n" + (''.join(blocks) if blocks else "No comments found.\n")
 
-                # Find all replies to this root comment. Guard against a
-                # None == None match (commit comments / comments without ids)
-                # which would otherwise make a comment a reply to itself.
-                replies = [
-                    c for c in file_comments
-                    if c['in_reply_to_id'] is not None
-                    and c['in_reply_to_id'] == root_comment['id']
-                ]
-                thread.extend(replies)
+    def _format_comment_threads(self, comments: List[Dict[str, Any]],
+                                files_by_path: Dict[str, Dict[str, Any]],
+                                separate_names: Dict[str, str], with_code: bool) -> str:
+        """
+        Format inline comments as threads, each under a header naming its file
+        and what the comment was left on, followed by that code.
 
-                # Also check for nested replies (replies to replies).
-                for reply in replies:
-                    nested_replies = [
-                        c for c in file_comments
-                        if c['in_reply_to_id'] is not None
-                        and c['in_reply_to_id'] == reply['id']
-                    ]
-                    thread.extend(nested_replies)
+        Args:
+            comments: Comments anchored to a file
+            files_by_path: Every changed file, keyed by path
+            separate_names: Output file name of each separately extracted file
+            with_code: True when Code.md and the separate files are written too
 
-                all_threads.append({
-                    'filepath': filepath,
-                    'comments': thread
-                })
-
-        if not all_threads:
-            feedback_md += "No comments found.\n"
-            return feedback_md
-
-        # Now process each thread with its own file header and code context.
-        for thread in all_threads:
-            filepath = thread['filepath']
-            thread_comments = thread['comments']
-
-            # File header for each comment/conversation.
-            feedback_md += f"### `{filepath}`\n\n"
-
-            # Show code context for this thread.
-            first_comment = thread_comments[0]
-            extension = self.get_file_extension(filepath)
-            context_lines = []
-
-            if first_comment['code']:
-                # PR review comment: the diff_hunk is the comment-time snapshot,
-                # anchored by line / start_line.
-                comment_line = first_comment.get('line', 0) or 0
-                start_line = first_comment.get('start_line') or None
-                context_lines = self.extract_comment_context(
-                    first_comment['code'],
-                    comment_line=comment_line,
-                    start_line=start_line,
-                )
-            elif filepath != 'General':
-                # Commit comment: no diff_hunk. GitHub anchors it by `position`
-                # (an index into the file's diff); the `line` field is often
-                # absent. Source the snippet from the file's full patch.
-                file_data = files_by_path.get(filepath)
-                full_patch = file_data.get('patch', '') if file_data else ''
-                if full_patch:
-                    position = first_comment.get('position') or 0
-                    comment_line = first_comment.get('line', 0) or 0
-                    if position:
-                        context_lines = self._extract_context_by_position(full_patch, position)
-                    elif comment_line:
-                        context_lines = self._extract_lines_with_context(full_patch, comment_line)
-
-            if context_lines:
-                feedback_md += f"```{extension}\n"
-                feedback_md += '\n'.join(context_lines)
-                feedback_md += "\n```\n\n"
-
-            # Format comments based on thread size.
-            if len(thread_comments) == 1:
-                # Single comment - use bullet format with cleaned body.
-                comment = thread_comments[0]
-                # Clean up extra newlines in comment body.
-                clean_body = re.sub(r'\n\n+', '\n', comment['body']).strip()
-                feedback_md += f"- `{comment['author']}` → {clean_body}\n\n"
+        Returns:
+            Markdown for the threads
+        """
+        ids = {comment.get('id') for comment in comments if comment.get('id') is not None}
+        replies: Dict[Any, List[Dict[str, Any]]] = {}
+        roots = []
+        for comment in comments:
+            parent = comment.get('in_reply_to_id')
+            # A reply whose parent was deleted becomes a thread of its own
+            # instead of disappearing.
+            if parent is not None and parent in ids:
+                replies.setdefault(parent, []).append(comment)
             else:
-                # Multiple comments - format as conversation in code block.
-                feedback_md += "```\n"
-                for i, comment in enumerate(thread_comments):
-                    author = comment['author']
-                    body = comment['body']
+                roots.append(comment)
 
-                    # Clean up extra newlines - collapse multiple blank lines to single blank line.
-                    clean_body = re.sub(r'\n\n+', '\n\n', body).strip()
+        # Same order as Code.md: category, then the order GitHub lists the files in.
+        file_order = {path: index for index, path in enumerate(files_by_path)}
 
-                    # Format with author and arrow.
-                    feedback_md += f"- {author} → "
+        def thread_order(root):
+            path = root.get('path') or ''
+            line = root.get('line') or root.get('original_line') or root.get('position') or 0
+            return (self.categorize_file(path), file_order.get(path, len(file_order)), path,
+                    line, root.get('created_at') or '')
 
-                    # Check if body is multi-line.
-                    if '\n' in clean_body:
-                        # Multi-line: put content on next line with indentation.
-                        feedback_md += "\n\n"
-                        # Indent all lines, but don't add spaces to blank lines.
-                        lines = clean_body.split('\n')
-                        indented_lines = []
-                        for line in lines:
-                            if line.strip():  # Non-blank line
-                                indented_lines.append('    ' + line)
-                            else:  # Blank line
-                                indented_lines.append('')
-                        indented_body = '\n'.join(indented_lines)
-                        feedback_md += indented_body
-                    else:
-                        # Single line: keep on same line.
-                        feedback_md += clean_body
+        def thread_of(root):
+            thread, pending = [], list(replies.get(root.get('id'), []))
+            while pending:
+                reply = pending.pop()
+                thread.append(reply)
+                pending.extend(replies.get(reply.get('id'), []))
+            return [root] + sorted(thread, key=lambda reply: reply.get('created_at') or '')
 
-                    # Add spacing between comments.
-                    if i < len(thread_comments) - 1:
-                        feedback_md += "\n\n"
+        output = ''
+        noted_paths = set()
+        for root in sorted(roots, key=thread_order):
+            path = root.get('path') or ''
+            file_data = files_by_path.get(path)
+            patch = file_data.get('patch', '') if file_data else ''
 
-                feedback_md += "\n```\n\n"
+            target = self._describe_comment_target(root, patch)
+            output += f"### `{path}`" + (f" · {target}" if target else '') + "\n\n"
 
-        return feedback_md
+            if with_code and path not in noted_paths:
+                note = self._feedback_location_note(path, files_by_path, separate_names)
+                if note:
+                    output += f"_{note}_\n\n"
+            noted_paths.add(path)
+
+            snippet = self._comment_snippet(root, patch)
+            if snippet:
+                fence = self._code_fence(snippet)
+                output += f"{fence}{self.get_file_extension(path)}\n" + '\n'.join(snippet) + f"\n{fence}\n\n"
+
+            for comment in thread_of(root):
+                output += f"- `{self._author(comment)}` →{self._format_comment_body(comment.get('body'))}\n\n"
+
+        return output
+
+    def _describe_comment_target(self, comment: Dict[str, Any], patch: str) -> str:
+        """
+        Describe what an inline comment was left on, for its header: 'line 57',
+        'lines 50–57', 'whole file', or 'line 57 (outdated)' once later pushes
+        changed the code it was left on.
+        """
+        if comment.get('subject_type') == 'file':
+            return 'whole file'
+
+        if comment.get('line'):
+            start, end, outdated = comment.get('start_line'), comment['line'], False
+        elif comment.get('original_line'):
+            start, end, outdated = comment.get('original_start_line'), comment['original_line'], True
+        elif comment.get('position') and patch:
+            # Commit comment: anchored by diff position; its 'line' is often absent.
+            start, end, outdated = None, self._line_for_position(patch, comment['position']), False
+        else:
+            return ''
+
+        if not end:
+            return ''
+        target = f"lines {start}–{end}" if start and start != end else f"line {end}"
+        return target + (' (outdated)' if outdated else '')
+
+    def _comment_snippet(self, comment: Dict[str, Any], patch: str) -> List[str]:
+        """
+        The code an inline comment refers to; none for a whole-file comment,
+        whose empty diff_hunk would otherwise pull in the top of the file.
+
+        A PR review comment's diff_hunk preserves the code as it was when the
+        comment was placed, outdated comments included. A commit comment has
+        no diff_hunk and is anchored by its diff position in the file's patch.
+        """
+        if comment.get('subject_type') == 'file':
+            return []
+
+        if comment.get('diff_hunk'):
+            # The hunk is frozen at the commit the comment was left on, so it
+            # is positioned with that commit's line numbers, not with 'line',
+            # which follows the latest push.
+            if comment.get('original_line'):
+                anchor, start = comment['original_line'], comment.get('original_start_line')
+            else:
+                anchor, start = comment.get('line') or 0, comment.get('start_line')
+            return self.extract_comment_context(comment['diff_hunk'], comment_line=anchor, start_line=start)
+
+        if not patch:
+            return []
+        if comment.get('position'):
+            return self._extract_context_by_position(patch, comment['position'])
+        if comment.get('line'):
+            return self._extract_lines_with_context(patch, comment['line'])
+        return []
+
+    def _feedback_location_note(self, path: str, files_by_path: Dict[str, Dict[str, Any]],
+                                separate_names: Dict[str, str]) -> str:
+        """Say where a commented file's diff is when it is not in Code.md."""
+        if path not in files_by_path:
+            return "File is no longer part of this diff"
+        ignored = self.should_ignore(path)
+        separate = separate_names.get(path)
+        if not ignored and not separate:
+            return ''
+        note = "Not in Code.md (matches Ignore.txt)" if ignored else "Not in Code.md"
+        return note + (f"; full diff in `{separate}`" if separate else '')
+
+    @staticmethod
+    def _author(item: Dict[str, Any]) -> str:
+        """Login of a comment's or review's author."""
+        return (item.get('user') or {}).get('login', 'unknown')
+
+    @staticmethod
+    def _format_comment_body(body: Optional[str]) -> str:
+        """
+        Format a comment body to follow 'author →' in a bullet.
+
+        A one-line body stays on the bullet's line. A longer one starts on the
+        next paragraph, indented as the bullet's continuation, so blank lines,
+        lists and code blocks survive as the reviewer wrote them.
+        """
+        text = (body or '').replace('\r\n', '\n').strip()
+        if '\n' not in text:
+            return f" {text}" if text else ''
+        return '\n\n' + '\n'.join(f"  {line}" if line.strip() else '' for line in text.split('\n'))
 
     def generate_markdown_sections(self, data: Dict[str, Any],
                                    sections: Optional[Sequence[str]] = None) -> Dict[str, Any]:
@@ -1146,12 +1615,14 @@ class GitHubParser:
         sections = list(sections) if sections else list(ALL_SECTIONS)
 
         all_files = data['files']
-        comments = data['comments']
 
         ignored_files = [f['filename'] for f in all_files if self.should_ignore(f['filename'])]
         separate_extraction_files = [
             f for f in all_files if self.should_extract_separately(f['filename'])
         ]
+        separate_output_names = self._separate_output_names(
+            [f['filename'] for f in separate_extraction_files]
+        )
 
         # Files matched for separate extraction are excluded from the main
         # output (Code.md) and are represented via standalone files.
@@ -1173,15 +1644,46 @@ class GitHubParser:
             'sections': sections,
             'ignored_files': ignored_files,
             'separate_extraction_files': separate_extraction_files,
+            'separate_output_names': separate_output_names,
             'main_output_files': [f['filename'] for f in files],
         }
 
         if 'code' in sections:
             result['code'] = self._build_code_md(files_by_category)
         if 'feedback' in sections:
-            result['feedback'] = self._build_feedback_md(comments, files_by_path)
+            result['feedback'] = self._build_feedback_md(
+                data, files_by_path, separate_output_names, with_code='code' in sections
+            )
 
         return result
+
+    def _separate_output_names(self, paths: List[str]) -> Dict[str, str]:
+        """
+        Relative output path of each separately extracted file: its group
+        folder, then the file's own repository path plus '.md', e.g.
+        ``MD/docs/setup.md.md`` or ``Config/src/Api/appsettings.json.md``.
+        A leading dot is dropped from folder names (``.github`` -> ``github``)
+        so tools that hide dot-folders, such as Obsidian, still show them.
+
+        Args:
+            paths: Paths of the separately extracted files
+
+        Returns:
+            Output path (forward slashes) for each path
+        """
+        names: Dict[str, str] = {}
+        used = set()
+        for path in paths:
+            parts = list(PurePosixPath(self._normalize_path(path)).parts)
+            folders = [part.lstrip('.') or part for part in parts[:-1]]
+            base = '/'.join([self.extraction_group(path) or 'Other'] + folders + [parts[-1]])
+            candidate, counter = f"{base}.md", 2
+            while candidate in used:
+                candidate = f"{base}__{counter}.md"
+                counter += 1
+            used.add(candidate)
+            names[path] = candidate
+        return names
 
     def _output_folder_name(self, kind: str, identifier: str, repo_name: str) -> str:
         """Build the output folder name for a PR or commit."""
@@ -1237,11 +1739,20 @@ class GitHubParser:
             print(f"\n✓ All files saved to: {output_folder}")
             return
 
-        # Save Ignore_Report.txt
-        ignore_report_file = output_folder / 'Ignore_Report.txt'
+        separate_files = sections.get('separate_extraction_files', [])
+        separate_names = sections.get('separate_output_names') or self._separate_output_names(
+            [f['filename'] for f in separate_files]
+        )
+
+        reports_folder = output_folder / 'Reports'
+        reports_folder.mkdir(exist_ok=True)
+
+        # Save Reports/Ignore_Report.txt
+        ignore_report_file = reports_folder / 'Ignore_Report.txt'
         with open(ignore_report_file, 'w', encoding='utf-8') as f:
             f.write("# Ignore Report\n")
-            f.write("# This report shows which files were ignored during parsing\n\n")
+            f.write("# Files matching Ignore.txt are left out of Code.md and are not extracted\n")
+            f.write("# separately. Review comments on them still appear in Feedback.md.\n\n")
 
             f.write("## Ignore Patterns Used\n")
             f.write("# Loaded from: Ignore.txt in repository\n")
@@ -1256,45 +1767,21 @@ class GitHubParser:
                     f.write(f"{ignored_file}\n")
             else:
                 f.write("(No files were ignored)\n")
-        print(f"  ✓ Saved: Ignore_Report.txt ({len(sections['ignored_files'])} files ignored)")
+        print(f"  ✓ Saved: Reports/Ignore_Report.txt ({len(sections['ignored_files'])} files ignored)")
 
-        # Save separately extracted file diffs as markdown files in the root folder.
-        separate_files = sections.get('separate_extraction_files', [])
-        used_output_names = set()
+        # Save separately extracted file diffs under their group folder,
+        # mirroring the repository path.
         generated_extraction_files = []
         for file_data in separate_files:
             filepath = file_data['filename']
-            status = file_data.get('status', '')
-            source_name = PurePosixPath(filepath).name
-            output_name = f"{source_name}.md"
-
-            # Avoid overwriting when two files share the same base filename.
-            if output_name in used_output_names:
-                source_stem = PurePosixPath(filepath).stem
-                source_suffix = PurePosixPath(filepath).suffix
-                counter = 2
-                while True:
-                    candidate = f"{source_stem}__{counter}{source_suffix}.md"
-                    if candidate not in used_output_names:
-                        output_name = candidate
-                        break
-                    counter += 1
-
-            used_output_names.add(output_name)
-            output_file = output_folder / output_name
-            extracted_md = self.format_code_changes(file_data)
+            output_name = separate_names[filepath]
             generated_extraction_files.append((filepath, output_name))
-
+            output_file = output_folder / output_name
+            output_file.parent.mkdir(parents=True, exist_ok=True)
             with open(output_file, 'w', encoding='utf-8') as f:
-                if extracted_md:
-                    f.write(extracted_md)
-                else:
-                    # Keep fallback output in markdown when GitHub provides no textual patch.
-                    f.write(f"### `{filepath}`\n\n")
-                    f.write("No textual patch available from GitHub for this file.\n\n")
-                    f.write(f"- Status: `{status}`\n")
+                f.write(self.format_code_changes(file_data))
 
-        separate_report_file = output_folder / 'SeparateExtraction_Report.txt'
+        separate_report_file = reports_folder / 'SeparateExtraction_Report.txt'
         with open(separate_report_file, 'w', encoding='utf-8') as f:
             f.write("# Separate Extraction Report\n")
             f.write(
@@ -1304,10 +1791,10 @@ class GitHubParser:
 
             f.write("## Extraction Patterns Used\n")
             f.write("# Loaded from: SeparateExtractionList.txt in repository\n")
-            f.write(f"# Total patterns: {len(self.separate_extraction_patterns)}\n\n")
-            if self.separate_extraction_patterns:
-                for pattern in self.separate_extraction_patterns:
-                    f.write(f"{pattern}\n")
+            f.write(f"# Total patterns: {len(self.separate_extraction_rules)}\n\n")
+            if self.separate_extraction_rules:
+                for group, pattern in self.separate_extraction_rules:
+                    f.write(f"[{group}] {pattern}\n")
             else:
                 f.write("(No patterns configured)\n")
 
@@ -1322,7 +1809,7 @@ class GitHubParser:
         print(
             f"  ✓ Saved: {len(separate_files)} separately extracted markdown diff file(s)"
         )
-        print("  ✓ Saved: SeparateExtraction_Report.txt")
+        print("  ✓ Saved: Reports/SeparateExtraction_Report.txt")
 
         print(f"\n✓ All files saved to: {output_folder}")
 
@@ -1347,9 +1834,10 @@ class GitHubParser:
 
             # Fetch data
             data = self.fetch_data(parsed)
-            total_files = len(data['files'])
-            total_comments = len(data['comments'])
-            print(f"Found {total_files} files and {total_comments} comments")
+            print(
+                f"Found {len(data['files'])} files, {len(data['comments'])} inline comments, "
+                f"{len(data['conversation'])} conversation comments and {len(data['reviews'])} reviews"
+            )
 
             # Generate markdown sections
             print("Generating markdown sections...")
@@ -1463,13 +1951,13 @@ def main():
         print("  Edit Ignore.txt in the repository to configure ignore patterns")
 
     # Show loaded separate extraction patterns
-    if parser.separate_extraction_patterns:
+    if parser.separate_extraction_rules:
         print(
             f"\nSeparate extraction patterns loaded from SeparateExtractionList.txt "
-            f"({len(parser.separate_extraction_patterns)} patterns):"
+            f"({len(parser.separate_extraction_rules)} patterns):"
         )
-        for pattern in parser.separate_extraction_patterns:
-            print(f"  - {pattern}")
+        for group, pattern in parser.separate_extraction_rules:
+            print(f"  - [{group}] {pattern}")
     else:
         print("\n⚠ No separate extraction patterns loaded")
         print("  Edit SeparateExtractionList.txt in the repository to configure patterns")

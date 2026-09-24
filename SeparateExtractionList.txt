@@ -1,13 +1,40 @@
-# separate_extraction_list.txt - Patterns for separately extracted changed files
-# One glob pattern per line. Supports wildcard matching.
+# SeparateExtractionList.txt - Changed files that get their own diff file instead of going into Code.md
 #
-# Files that match these patterns are additionally extracted to:
-#   <Desktop>/PR_<number>_<repo>/<source-filename>.md
-# and contain diff-style markdown content.
+# A [Section] header names the output subfolder for the patterns below it.
+# Each file is written to <output folder>/<Section>/<its repository path>.md,
+# e.g. MD/docs/setup.md.md or Config/src/Api/appsettings.json.md.
+# Leading dots are dropped from folder names (.github -> github).
 #
-# Starters
-*appsettings*.json
-**/appsettings*.json
-*.md
+# Same pattern syntax as Ignore.txt; the last matching line decides the section.
+# Files matching Ignore.txt are never extracted.
+
+[MD]
 **/*.md
+
+[Config]
+**/appsettings*.json
+**/*.config
+**/.env.example
+**/*.yml
+**/*.yaml
+**/Dockerfile
+**/docker-compose*.yml
+
+[Dependencies]
+**/package.json
 **/*.csproj
+**/Directory.Packages.props
+**/Directory.Build.props
+**/requirements*.txt
+**/pyproject.toml
+**/go.mod
+**/Cargo.toml
+**/pom.xml
+**/build.gradle
+**/build.gradle.kts
+
+# CI comes last so workflow YAML lands here rather than in Config.
+[CI]
+**/.github/workflows/*
+**/azure-pipelines*.yml
+**/.gitlab-ci.yml

@@ -1,0 +1,22 @@
+# Categories.txt - Sections of Code.md
+#
+# A [Section] header names a Code.md section; files matching the patterns below it
+# go there. Same pattern syntax as Ignore.txt, and the last matching line wins,
+# so put broad sections first and more specific ones after. Unmatched files go to
+# "Other". Sections appear in Code.md in alphabetical order.
+
+[Frontend]
+ui/*
+frontend/*
+**/*.ts
+**/*.tsx
+**/*.jsx
+**/*.vue
+
+# Listed after Frontend so an api/ file or a .cs file under ui/ counts as Backend.
+[Backend]
+api/*
+**/*.cs
+**/*.java
+**/*.py
+**/*.go

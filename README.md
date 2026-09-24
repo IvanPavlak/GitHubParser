@@ -14,6 +14,8 @@ one section (for example, only the feedback/comments).
 - Configurable extra extraction rules through `SeparateExtractionList.txt`
 - Generates a desktop output folder for the selected PR or commit
 - Produces diff-style markdown for both main code output and separate extraction files
+- Shows markdown document changes as word-level diffs, so a one-word edit in a long paragraph stays readable
+- Captures every review verdict and comment, including comments on ignored files
 
 ## Requirements
 
@@ -181,71 +183,142 @@ Files written (only for the sections you requested):
 
 - `Code.md` (section `code`)
 - `Feedback.md` (section `feedback`)
-- `Ignore_Report.txt` (only when `code` is requested)
-- `SeparateExtraction_Report.txt` (only when `code` is requested)
+- `Reports/Ignore_Report.txt` (only when `code` is requested)
+- `Reports/SeparateExtraction_Report.txt` (only when `code` is requested)
 
-Additional extracted files (from `SeparateExtractionList.txt`) are created in the
-same root output folder, for example:
+Files matched by `SeparateExtractionList.txt` are written to a subfolder named after their
+section, mirroring their path in the repository (leading dots are dropped from folder names,
+so `.github` becomes `github`):
 
-- `appsettings.Development.json.md`
-- `CHANGELOG.md.md`
-- `MyProject.csproj.md`
+```text
+PR_123_org_repo/
+  Code.md
+  Feedback.md
+  MD/
+    README.md.md
+    docs/setup.md.md
+  Config/
+    src/Api/appsettings.json.md
+  Dependencies/
+    src/Api/MyProject.csproj.md
+    web/package.json.md
+  CI/
+    github/workflows/build.yml.md
+  Reports/
+    Ignore_Report.txt
+    SeparateExtraction_Report.txt
+```
 
-If multiple matched files share the same source filename, a numeric suffix is added to avoid overwrite.
+Running the parser again for the same PR or commit overwrites files of the same name;
+files from an earlier run that are no longer produced stay in the folder.
 
 ## Configuration
 
 ### Ignore.txt
 
-Controls which files are ignored for the main parsing outputs.
+Controls which files are left out entirely: they are not in `Code.md` and not extracted
+separately. It does not filter feedback: review comments on ignored files still appear in
+`Feedback.md`.
 
-Pattern behavior:
+The starter list ignores lock files, generated code (migrations, `*.Designer.cs`, `*.g.cs`,
+snapshots), build output and bundles (`dist/`, `bin/`, `*.min.js`, `*.map`), vendored code
+(`node_modules/`, `vendor/`) and binary assets (images, fonts, archives).
+
+Pattern behavior (shared by all three pattern files):
 
 - One glob pattern per line
 - Lines starting with `#` are comments
 - Optional negation with `!pattern`
 - Last matching rule wins
+- `*` matches across folders, so `*.md` matches `docs/setup.md` too
+- A leading `**/` also matches at the repository root, as in `.gitignore`: `**/*.md` matches `CHANGELOG.md` and `docs/setup.md`
 
 ### SeparateExtractionList.txt
 
-Controls which changed files get standalone markdown diff files in the output root.
+Controls which changed files get their own markdown diff file instead of a place in `Code.md`.
+A `[Section]` header names the output subfolder for the patterns below it; when several
+sections match, the last matching line wins.
 
-Files that match these patterns are excluded from the main output (`Code.md`) so they appear only in their dedicated extracted files.
+```text
+[MD]
+**/*.md
 
-Current starter patterns include:
+[Config]
+**/appsettings*.json
+**/*.yml
+```
 
-- appsettings JSON files
-- changelog markdown files
-- csproj files
+Starter sections:
+
+- `MD`: markdown documents
+- `Config`: appsettings, `*.config`, `.env.example`, YAML, `Dockerfile`, docker-compose files
+- `Dependencies`: `package.json`, `*.csproj`, `Directory.*.props`, `requirements*.txt`,
+  `pyproject.toml`, `go.mod`, `Cargo.toml`, `pom.xml`, Gradle build files
+- `CI`: `.github/workflows/*`, Azure Pipelines and GitLab CI files (listed last, so workflow
+  YAML lands here rather than in `Config`)
+
+### Categories.txt
+
+Controls the sections of `Code.md`, with the same `[Section]` syntax: a file goes to the
+section of its last matching pattern, and to `Other` when nothing matches. Sections appear in
+alphabetical order. The starter file puts `ui/`, `frontend/` and TypeScript/JSX/Vue files under
+`Frontend`, and `api/` plus C#/Java/Python/Go files under `Backend` (listed second, so it wins
+when both match).
 
 ## Output format details
 
 ### Code.md and separate extraction files
 
-Diffs are rendered in markdown code blocks with old/new sections when patch data is available.
+Code diffs are rendered in markdown code blocks with old/new sections when patch data is available.
 
 Files matched by `SeparateExtractionList.txt` are not included in `Code.md`; they are written only to separate extracted markdown files.
 
-When GitHub does not provide textual patch data for a file, the separate extraction file still gets created with a markdown note and status.
+When GitHub does not provide textual patch data for a file (binary files, very large diffs,
+renames without changes), the file keeps its heading with a note saying so, both in `Code.md`
+and in separate extraction files.
+
+### Markdown files
+
+Markdown documents are prose, so they get a layout of their own:
+
+- A new file is shown as the document itself.
+- Each change in a modified file is a `diff` block with one line of context around it
+  (context lines are cut at 120 characters):
+  - `+` added line, `-` removed line
+  - `!` line edited in place, with the edit marked as `[-removed-]{+added+}` and unchanged
+    stretches shortened to `…`, so a one-word change in a long paragraph stays visible
+- Changes that only touch whitespace (re-padded tables, re-indented lists, re-flowed text) are
+  left out and listed in one note with their line numbers.
+- An added line identical to the line next to it is flagged as a possible accidental duplicate,
+  a common leftover of merge conflicts resolved by keeping both sides.
+- A removed file lists its lines as removals.
 
 ### Feedback.md
 
-All feedback on a pull request is captured, not just inline code notes:
+All feedback is captured, whether or not its file matches `Ignore.txt`:
 
-- Inline review comments (anchored to a diff line)
-- Conversation-tab comments (general discussion, not attached to code)
-- Review summaries (the message submitted with an Approve / Comment / Request-changes review)
+- **Reviews**, first: each reviewer's verdict (Approved / Changes requested / Dismissed) with its
+  date and summary. A plain "Commented" review appears only when it has a message.
+- **Conversation**: Conversation-tab comments, or for a commit, comments on the commit as a whole.
+- **Comments**: inline comment threads, grouped by file in `Code.md` order and sorted by line.
+  Each heading names what the comment was left on: `· line 57`, `· lines 50–57`,
+  `· whole file`, or `· line 57 (outdated)` once later pushes changed that code. Replies
+  follow their comment; a reply whose parent was deleted is kept as its own thread.
 
-Comments not attached to a file are grouped under a `General` heading. For a commit,
-both file-level and general commit comments are captured the same way.
+Comment text keeps the reviewer's formatting (paragraphs, lists, code blocks). When `code` is
+extracted in the same run, a comment on a file that is not in `Code.md` gets a note saying so and
+naming the file's separately extracted diff, if there is one.
 
 Code snippets for anchored comments are extracted with this behavior:
 
-- For PR review comments, the code snippet comes from the comment's diff hunk
-- For commit comments (which have no diff hunk), the snippet comes from the file's patch using the comment line
-- Exact selected range when start_line and line are available
+- For PR review comments, the code snippet comes from the comment's diff hunk (the code as it
+  was when commented), positioned with the comment's original line numbers
+- For commit comments (which have no diff hunk), the snippet comes from the file's patch using
+  the comment's diff position, or its line
+- Exact selected range when a multi-line range was selected
 - Otherwise the line with surrounding context
 - Tail fallback when line metadata is unavailable
+- Whole-file comments have no snippet
 
 ## Troubleshooting
 
@@ -259,19 +332,21 @@ Common causes:
 
 ### Missing files in output
 
-- Check `Ignore_Report.txt` for ignored files
-- Check `SeparateExtraction_Report.txt` for files matched by `SeparateExtractionList.txt`
+- Check `Reports/Ignore_Report.txt` for ignored files
+- Check `Reports/SeparateExtraction_Report.txt` for files matched by `SeparateExtractionList.txt` and where they were written
 - Verify patterns in `Ignore.txt` and `SeparateExtractionList.txt`
 
 ### Rate limit issues
 
-Unauthenticated GitHub API usage is limited. Set `GITHUB_TOKEN` to increase limits.
+Unauthenticated GitHub API usage is limited. Set `GITHUB_TOKEN` to increase limits. When the
+limit is reached, the parser stops and says when it resets. Each request times out after 30 seconds.
 
 ## Repository files
 
 - `GitHubParser.py`: main parser
 - `Ignore.txt`: ignore rules
-- `SeparateExtractionList.txt`: rules for extra extracted markdown files
+- `SeparateExtractionList.txt`: rules for separately extracted files and their output folders
+- `Categories.txt`: rules for the sections of `Code.md`
 - `LICENSE`: MIT License
 - `GitHubParser.yml`: conda environment spec
 - `GitHubParser.bat`: batch launcher (path-dependent)
