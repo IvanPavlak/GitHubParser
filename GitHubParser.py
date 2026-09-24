@@ -470,9 +470,9 @@ class GitHubParser:
 
         Captures every kind of PR comment so feedback is not limited to inline
         code notes:
-          * inline review comments  (/pulls/{n}/comments)  – anchored to a diff line
-          * conversation comments   (/issues/{n}/comments) – general timeline, no code
-          * reviews                 (/pulls/{n}/reviews)    – the Approve/Comment/Request-changes
+          * inline review comments  (/pulls/{n}/comments)  - anchored to a diff line
+          * conversation comments   (/issues/{n}/comments) - general timeline, no code
+          * reviews                 (/pulls/{n}/reviews)    - the Approve/Comment/Request-changes
                                                               verdict and its optional summary
 
         Args:
@@ -1083,10 +1083,10 @@ class GitHubParser:
         new_lines = [row['new'] for row in hunk if row['kind'] in ('+', 'edit')]
         if new_lines:
             first, last = min(new_lines), max(new_lines)
-            return f"Line {first}" if first == last else f"Lines {first}–{last}"
+            return f"Line {first}" if first == last else f"Lines {first}-{last}"
         old_lines = [row['old'] for row in hunk if row['kind'] == '-']
         first, last = min(old_lines), max(old_lines)
-        return f"Removed old line {first}" if first == last else f"Removed old lines {first}–{last}"
+        return f"Removed old line {first}" if first == last else f"Removed old lines {first}-{last}"
 
     def _duplicate_warnings(self, hunk: List[Dict[str, Any]]) -> List[tuple]:
         """
@@ -1130,14 +1130,14 @@ class GitHubParser:
 
     @staticmethod
     def _line_ranges(numbers: List[int]) -> str:
-        """Compress line numbers into ranges: [8, 9, 10, 13] -> '8–10, 13'."""
+        """Compress line numbers into ranges: [8, 9, 10, 13] -> '8-10, 13'."""
         ranges: List[List[int]] = []
         for number in sorted(set(numbers)):
             if ranges and number == ranges[-1][1] + 1:
                 ranges[-1][1] = number
             else:
                 ranges.append([number, number])
-        return ', '.join(f"{first}" if first == last else f"{first}–{last}" for first, last in ranges)
+        return ', '.join(f"{first}" if first == last else f"{first}-{last}" for first, last in ranges)
 
     def _build_new_line_map(self, patch: str) -> List[tuple]:
         """
@@ -1170,7 +1170,7 @@ class GitHubParser:
             if line.startswith('---') or line.startswith('+++'):
                 continue
             if line.startswith('-'):
-                # Removed line – not in new file
+                # Removed line - not in new file
                 continue
             if line.startswith('+') or line.startswith(' '):
                 new_line_map.append((current_new_line, line[1:]))
@@ -1204,7 +1204,7 @@ class GitHubParser:
                 break
 
         if anchor_idx is None:
-            # Anchor not found – fall back to closest available line
+            # Anchor not found - fall back to closest available line
             closest = min(range(len(line_map)),
                           key=lambda i: abs(line_map[i][0] - anchor_line),
                           default=None)
@@ -1223,18 +1223,18 @@ class GitHubParser:
         Extract the code snippet a reviewer commented on.
 
         Always sources code from the diff_hunk, which preserves exactly the
-        code that was present when the comment was placed — even if the file
+        code that was present when the comment was placed - even if the file
         has since changed (outdated comments).
 
-        **Exact-range mode** – When the reviewer selected a clear range of
+        **Exact-range mode** - When the reviewer selected a clear range of
         lines (GitHub supplies both *start_line* and *comment_line*), return
         exactly those lines from the diff_hunk.
 
-        **Fallback context mode** – When only a single anchor line is known,
+        **Fallback context mode** - When only a single anchor line is known,
         return the anchor line with up to 5 lines of context above and below
         it (limited to what the diff_hunk contains).
 
-        **Last-resort mode** – If line numbers are unavailable (e.g. very old
+        **Last-resort mode** - If line numbers are unavailable (e.g. very old
         comments), show the tail of the diff_hunk with up to 5 lines of context.
 
         Args:
@@ -1265,7 +1265,7 @@ class GitHubParser:
                 return result
 
         # --- Fallback context mode (anchor ±5) -----------------------------------
-        # Single anchor line — show it with up to 5 lines above and below.
+        # Single anchor line - show it with up to 5 lines above and below.
         anchor = comment_line or 0
         if anchor:
             anchor_idx = None
@@ -1280,7 +1280,7 @@ class GitHubParser:
                 return [code for _, code in line_map[lo:hi]]
 
         # --- Last-resort mode ---------------------------------------------------
-        # No usable line numbers — show the tail of the hunk (the commented
+        # No usable line numbers - show the tail of the hunk (the commented
         # line is always the last line GitHub includes in the hunk).
         all_lines = [code for _, code in line_map]
         start_idx = max(0, len(all_lines) - 11)
@@ -1292,7 +1292,7 @@ class GitHubParser:
         Extract a window of new-file code around a GitHub diff *position*.
 
         Commit comments (unlike PR review comments) carry no diff_hunk and are
-        anchored by ``position`` — the 1-based index of the commented line within
+        anchored by ``position`` - the 1-based index of the commented line within
         the file's unified diff, counting every line after the first ``@@`` hunk
         header (later ``@@`` headers included). This maps that position back to
         the surrounding code on the new-file side.
@@ -1516,7 +1516,7 @@ class GitHubParser:
     def _describe_comment_target(self, comment: Dict[str, Any], patch: str) -> str:
         """
         Describe what an inline comment was left on, for its header: 'line 57',
-        'lines 50–57', 'whole file', or 'line 57 (outdated)' once later pushes
+        'lines 50-57', 'whole file', or 'line 57 (outdated)' once later pushes
         changed the code it was left on.
         """
         if comment.get('subject_type') == 'file':
@@ -1534,7 +1534,7 @@ class GitHubParser:
 
         if not end:
             return ''
-        target = f"lines {start}–{end}" if start and start != end else f"line {end}"
+        target = f"lines {start}-{end}" if start and start != end else f"line {end}"
         return target + (' (outdated)' if outdated else '')
 
     def _comment_snippet(self, comment: Dict[str, Any], patch: str) -> List[str]:

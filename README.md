@@ -301,7 +301,7 @@ All feedback is captured, whether or not its file matches `Ignore.txt`:
   date and summary. A plain "Commented" review appears only when it has a message.
 - **Conversation**: Conversation-tab comments, or for a commit, comments on the commit as a whole.
 - **Comments**: inline comment threads, grouped by file in `Code.md` order and sorted by line.
-  Each heading names what the comment was left on: `· line 57`, `· lines 50–57`,
+  Each heading names what the comment was left on: `· line 57`, `· lines 50-57`,
   `· whole file`, or `· line 57 (outdated)` once later pushes changed that code. Replies
   follow their comment; a reply whose parent was deleted is kept as its own thread.
 
