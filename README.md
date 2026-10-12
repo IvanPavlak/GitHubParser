@@ -1,17 +1,24 @@
 # GitHub Parser
 
-Extracts information from a GitHub **pull request or commit** and formats it into
-structured markdown files. You can extract everything, or selectively pull just
-one section (for example, only the feedback/comments).
+Extracts information from one or more GitHub **pull requests or commits** and formats
+it into structured markdown files in a single output folder. You can extract everything,
+or selectively pull just one section (for example, only the feedback/comments). A backend
+PR and its frontend PR can be parsed in one run: their files, feedback and extracted
+documents are grouped as Backend, then Frontend.
 
 ## Highlights
 
 - Works with pull requests **and** commits
+- Parses several PRs or commits into one folder, grouped by repository category
+  (`Repositories.txt`), so a backend PR and its frontend PR read Backend, then Frontend
 - Works with public and private repositories
 - Selective extraction: choose any of `code`, `feedback`
 - Handles paginated GitHub API responses for files and comments
 - Configurable ignore rules through `Ignore.txt`
 - Configurable extra extraction rules through `SeparateExtractionList.txt`
+- Configurable sections through `Categories.txt` (by path) and `Repositories.txt` (by repository)
+- Masks passwords, pass phrases, tokens, API keys and connection strings in extracted config files
+- Writes a `manifest.json` describing the sources and every extracted file, for importers
 - Generates a desktop output folder for the selected PR or commit
 - Produces diff-style markdown for both main code output and separate extraction files
 - Shows markdown document changes as word-level diffs, so a one-word edit in a long paragraph stays readable
@@ -82,7 +89,7 @@ Run with no arguments and the script prompts for:
 
 1. Whether the repository is private
 2. Which sections to extract (default: all)
-3. The PR or commit URL
+3. The PR or commit URL(s); several are separated by spaces or commas
 
 Example URLs:
 
@@ -108,11 +115,14 @@ python GitHubParser.py --sections code,feedback --public https://github.com/owne
 
 # Private repo, token from the environment
 python GitHubParser.py --private --only feedback <url>
+
+# A backend PR and its frontend PR in one run: one folder, grouped Backend / Frontend
+python GitHubParser.py --private https://github.com/owner/api/pull/21 https://github.com/owner/ui/pull/19
 ```
 
 | Flag                         | Description                                                                                                         |
 | ---------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `url` (positional)           | PR or commit URL. Prompted if omitted.                                                                              |
+| `url` (positional)           | PR or commit URL(s). Several URLs go into one folder, grouped by repository (see [Several PRs in one run](#several-prs-in-one-run)). Prompted if omitted. |
 | `-s`, `--sections`, `--only` | Comma-separated: `code`, `feedback`, or `all`. Alias: `comments` = `feedback`. Prompted if omitted (default `all`). |
 | `--private` / `--public`     | Skip the private/public prompt.                                                                                     |
 
@@ -147,11 +157,14 @@ GitHubParser -Sections code,feedback -Public https://github.com/owner/repo/pull/
 
 # Private repo: prompt (no echo) for a token, never placing it on the command line
 GitHubParser -Private -Token (Read-Host -AsSecureString) -Only feedback <url>
+
+# A backend PR and its frontend PR in one run
+GitHubParser -Private https://github.com/owner/api/pull/21 https://github.com/owner/ui/pull/19
 ```
 
 | Parameter              | Description                                                                                                                                                                                           |
 | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `-Url` (positional)    | PR or commit URL. Prompted if omitted.                                                                                                                                                                |
+| `-Url` (positional)    | One or more PR or commit URLs. Several URLs go into one folder, grouped by repository. Prompted if omitted.                                                                                            |
 | `-Sections` / `-Only`  | Comma-separated: `code`, `feedback`, or `all`. Alias: `comments` = `feedback`. Accepts an array (`code,feedback`).                                                                                    |
 | `-Token`               | GitHub token as a **SecureString** (e.g. `(Read-Host -AsSecureString)`). Injected via the `GITHUB_TOKEN` environment variable for the child process only, then cleared - never passed as an argument. |
 | `-Private` / `-Public` | Skip the private/public prompt.                                                                                                                                                                       |
@@ -177,12 +190,15 @@ Output is written to a folder on your desktop, named by source:
 ```text
 <Desktop>/PR_123_org_repo/          # for a pull request
 <Desktop>/Commit_d974808_org_repo/  # for a commit (short SHA)
+<Desktop>/PR_21&19_org_repo/        # for several PRs (named after the first repository)
 ```
 
 Files written (only for the sections you requested):
 
 - `Code.md` (section `code`)
 - `Feedback.md` (section `feedback`)
+- `manifest.json` (always): the sources (repository, number, title, author, branches, state,
+  category) and every separately extracted file with its section, group and output path
 - `Reports/Ignore_Report.txt` (only when `code` is requested)
 - `Reports/SeparateExtraction_Report.txt` (only when `code` is requested)
 
@@ -211,6 +227,31 @@ PR_123_org_repo/
 
 Running the parser again for the same PR or commit overwrites files of the same name;
 files from an earlier run that are no longer produced stay in the folder.
+
+### Several PRs in one run
+
+Give several URLs and they are written to one folder, `PR_21&19_org_repo` (the identifiers
+joined with `&`, named after the first repository). Every source gets a **group**: its
+repository's category from `Repositories.txt`, or its repository name when it is not listed.
+Two sources that would share a label (two PRs of one repository) get the PR number appended.
+
+- `Code.md`: one `## <group>` per source, so `## Backend` then `## Frontend`
+- `Feedback.md`: one `## <group>` per source holding its `### Reviews`, `### Conversation`
+  and `### Comments` (per-file headings become `####`)
+- Separately extracted files: the group is the folder after the section, so two repositories
+  with the same path cannot collide: `MD/Backend/CHANGELOG.md.md`, `MD/Frontend/CHANGELOG.md.md`
+- Reports and `manifest.json` label every file with its group
+
+```text
+PR_21&19_org_api/
+  Code.md                       # Backend, then Frontend
+  Feedback.md                   # Backend, then Frontend
+  manifest.json
+  Config/Backend/src/Api/appsettings.json.md
+  MD/Backend/CHANGELOG.md.md
+  MD/Frontend/CHANGELOG.md.md
+  Reports/...
+```
 
 ## Configuration
 
@@ -261,9 +302,43 @@ Starter sections:
 
 Controls the sections of `Code.md`, with the same `[Section]` syntax: a file goes to the
 section of its last matching pattern, and to `Other` when nothing matches. Sections appear in
-alphabetical order. The starter file puts `ui/`, `frontend/` and TypeScript/JSX/Vue files under
-`Frontend`, and `api/` plus C#/Java/Python/Go files under `Backend` (listed second, so it wins
-when both match).
+alphabetical order. The starter file puts `ui/`, `frontend/` and JavaScript/TypeScript/JSX/Vue
+files under `Frontend`, and `api/`, C#/Java/Python/Go files and `Localization/` resources under
+`Backend` (listed second, so it wins when both match).
+
+These rules are for monorepos and unlisted repositories. A repository listed in
+`Repositories.txt` skips them: all its files get that section.
+
+### Repositories.txt
+
+Gives a whole repository a section, with the same `[Section]` syntax. Patterns are matched
+case-insensitively against `owner/repo`; a pattern without a `/` is matched against the
+repository name alone, and the last matching line wins.
+
+```text
+[Frontend]
+*-ui
+*-frontend
+
+[Backend]
+*-api
+owner/MyProject
+```
+
+A listed repository's files all go under that section in `Code.md`, whatever their paths.
+In a run with several PRs, the section is also the group of the repository's feedback and
+separately extracted files (see [Several PRs in one run](#several-prs-in-one-run)). Leave a
+monorepo unlisted so `Categories.txt` splits it by path.
+
+### Secrets in config files
+
+Separately extracted files of the `Config` section have the values of secret-looking keys
+masked as `***` before they are written: keys containing `password`, `passphrase`, `secret`,
+`token`, `apikey`/`api_key`, `clientsecret`, `privatekey` or `connectionstring`, in JSON pairs,
+YAML pairs, XML attributes, `.env` lines and `Key=value;` parts of connection strings. The key
+stays, so the diff still shows what changed. Code snippets of comments on those files are
+masked the same way, and `Reports/SeparateExtraction_Report.txt` and `manifest.json` say how
+many values each file had masked.
 
 ## Output format details
 
@@ -346,7 +421,8 @@ limit is reached, the parser stops and says when it resets. Each request times o
 - `GitHubParser.py`: main parser
 - `Ignore.txt`: ignore rules
 - `SeparateExtractionList.txt`: rules for separately extracted files and their output folders
-- `Categories.txt`: rules for the sections of `Code.md`
+- `Categories.txt`: rules for the sections of `Code.md` (by file path)
+- `Repositories.txt`: rules for the section of a whole repository
 - `LICENSE`: MIT License
 - `GitHubParser.yml`: conda environment spec
 - `GitHubParser.bat`: batch launcher (path-dependent)

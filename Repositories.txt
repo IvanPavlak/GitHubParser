@@ -1,0 +1,27 @@
+# Repositories.txt - Category of a whole repository
+#
+# A [Section] header names a Code.md section; a repository matching the patterns
+# below it gets that section for every one of its files, instead of the path
+# rules in Categories.txt. Patterns are matched case-insensitively against
+# "owner/repo"; a pattern without a "/" is matched against the repository name
+# alone. Same pattern syntax as Ignore.txt, and the last matching line wins.
+#
+# In a run with several PRs (a backend PR and its frontend PR), every file of a
+# source is grouped under its repository's section, or under the repository name
+# when it is not listed here, and so are its feedback and separately extracted
+# files. Leave a monorepo unlisted so its files are split by Categories.txt.
+
+[Frontend]
+*-ui
+*.ui
+*-frontend
+*-web
+*-client
+
+[Backend]
+*-api
+*.api
+*-backend
+*-server
+# Project-specific repositories whose name says nothing about their side:
+futurama-soft/NPPJ.RealEstateManagement

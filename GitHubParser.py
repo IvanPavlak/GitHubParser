@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
 GitHub Parser
-Extracts information from a GitHub pull request or commit and formats it into
-structured markdown files.
+Extracts information from one or more GitHub pull requests or commits and
+formats it into structured markdown files in a single output folder.
 
 Supports selective extraction of sections (code, feedback) so you
-can, for example, pull only the feedback/comments for a commit.
+can, for example, pull only the feedback/comments for a commit. Several
+URLs (a backend PR and its frontend PR) are grouped by repository category
+(Repositories.txt), so Code.md and Feedback.md read Backend, then Frontend.
 """
 
 import os
@@ -17,7 +19,8 @@ import requests
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import List, Dict, Any, Optional, Sequence
-from fnmatch import fnmatch
+from fnmatch import fnmatch, fnmatchcase
+import json
 
 
 # Canonical output sections and friendly aliases.
@@ -51,6 +54,25 @@ REVIEW_STATE_LABELS = {
     'COMMENTED': 'Commented',
 }
 REVIEW_VERDICT_STATES = ('APPROVED', 'CHANGES_REQUESTED', 'DISMISSED')
+
+# Separately extracted groups whose secret-looking values are masked before
+# they are written (see GitHubParser._redact_secrets): config files carry
+# passwords and keys that have no place in a review note.
+REDACTED_GROUPS = ('Config',)
+SECRET_KEY_WORDS = (r'password|passphrase|secret|token|apikey|api_key|api-key|clientsecret'
+                    r'|privatekey|private_key|connectionstring|connection_string')
+# (pattern, index of the group holding the value to mask)
+SECRET_PATTERNS = (
+    # JSON pairs: "DefaultPassPhrase": "value"
+    (re.compile(r'("[^"\n]*(?:' + SECRET_KEY_WORDS + r')[^"\n]*"\s*:\s*")([^"\\\n]*(?:\\.[^"\\\n]*)*)(")',
+                re.IGNORECASE), 2),
+    # YAML pairs: password: value
+    (re.compile(r'^(\s*[\w.-]*(?:' + SECRET_KEY_WORDS + r')[\w.-]*\s*:\s+)(\S.*?)(\s*)$',
+                re.IGNORECASE | re.MULTILINE), 2),
+    # XML attributes, .env lines and connection-string parts: password="value", Password=value;
+    (re.compile(r'((?:' + SECRET_KEY_WORDS + r')\w*\s*=\s*)(["\']?)([^"\'\s;,]+)', re.IGNORECASE), 3),
+)
+SECRET_MASK = '***'
 
 
 def resolve_sections(raw: Optional[str]) -> List[str]:
@@ -93,7 +115,8 @@ def resolve_sections(raw: Optional[str]) -> List[str]:
 class GitHubParser:
     def __init__(self, token: Optional[str] = None, ignore_path: Optional[str] = None,
                  separate_extraction_list_path: Optional[str] = None,
-                 categories_path: Optional[str] = None):
+                 categories_path: Optional[str] = None,
+                 repositories_path: Optional[str] = None):
         """
         Initialize the parser with an optional GitHub token.
 
@@ -103,6 +126,7 @@ class GitHubParser:
             separate_extraction_list_path: Path to SeparateExtractionList.txt file.
                 If None, looks in script directory.
             categories_path: Path to Categories.txt file. If None, looks in script directory.
+            repositories_path: Path to Repositories.txt file. If None, looks in script directory.
         """
         self.token = token or os.getenv('GITHUB_TOKEN')
         self.headers = {
@@ -129,6 +153,11 @@ class GitHubParser:
         else:
             categories_path = Path(categories_path)
 
+        if repositories_path is None:
+            repositories_path = script_dir / 'Repositories.txt'
+        else:
+            repositories_path = Path(repositories_path)
+
         self.ignore_patterns = self.load_patterns_file(ignore_path, 'Ignore.txt')
         # (group, pattern) pairs; the group names the output subfolder.
         self.separate_extraction_rules = self.load_grouped_patterns_file(
@@ -137,6 +166,11 @@ class GitHubParser:
         # (category, pattern) pairs deciding the Code.md sections.
         self.category_rules = self.load_grouped_patterns_file(
             categories_path, 'Categories.txt', default_group='Other'
+        )
+        # (category, pattern) pairs matched against 'owner/repo': a whole
+        # repository's category, which takes precedence over Categories.txt.
+        self.repository_rules = self.load_grouped_patterns_file(
+            repositories_path, 'Repositories.txt', default_group='Other'
         )
 
     def load_patterns_file(self, patterns_path: Path, list_name: str) -> List[str]:
@@ -334,6 +368,75 @@ class GitHubParser:
             Category name
         """
         return self.match_group(filepath, self.category_rules) or 'Other'
+
+    def repository_category(self, owner: str, repo: str) -> Optional[str]:
+        """
+        Category of a whole repository from Repositories.txt: the [Section] of
+        the last matching pattern, or None when nothing matches. Patterns are
+        matched case-insensitively against 'owner/repo'; a pattern without a
+        '/' is matched against the repository name alone, so '*-ui' matches
+        'futurama-soft/nnpj-realestatemanagement-ui'.
+
+        Args:
+            owner: Repository owner
+            repo: Repository name
+
+        Returns:
+            Category name, or None when the repository is not listed
+        """
+        full_name = f"{owner}/{repo}".lower()
+        name = repo.lower()
+        matched = None
+        for group, pattern in self.repository_rules:
+            is_negation = pattern.startswith('!')
+            candidate = (pattern[1:] if is_negation else pattern).lower()
+            subject = full_name if '/' in candidate else name
+            if fnmatchcase(subject, candidate):
+                matched = None if is_negation else group
+        return matched
+
+    def file_category(self, source: Dict[str, Any], filepath: str) -> str:
+        """
+        Code.md section of a file: its source's group when the run gave the
+        source one (a repository listed in Repositories.txt, or every source
+        of a run with several PRs), otherwise the Categories.txt category.
+
+        Args:
+            source: Source dict (see :meth:`parse`) the file belongs to
+            filepath: Path of the file in its repository
+
+        Returns:
+            Category name
+        """
+        return source.get('group') or self.categorize_file(filepath)
+
+    @staticmethod
+    def _redact_secrets(text: str) -> tuple:
+        """
+        Mask the values of secret-looking keys (passwords, pass phrases,
+        tokens, API keys, connection strings) in config text, keeping the
+        keys so the diff still shows what changed.
+
+        Args:
+            text: Formatted markdown for a config file
+
+        Returns:
+            (text with masked values, number of values masked)
+        """
+        masked = 0
+
+        def replace(match, value_group):
+            nonlocal masked
+            value = match.group(value_group)
+            if not value.strip() or value == SECRET_MASK:
+                return match.group(0)
+            masked += 1
+            start, end = match.span(value_group)
+            return match.group(0)[:start - match.start()] + SECRET_MASK + match.group(0)[end - match.start():]
+
+        for pattern, value_group in SECRET_PATTERNS:
+            text = pattern.sub(lambda match: replace(match, value_group), text)
+        return text, masked
 
     def get_file_extension(self, filepath: str) -> str:
         """Get the code block extension for markdown."""
@@ -1388,8 +1491,7 @@ class GitHubParser:
                 code_md += self.format_code_changes(file_data)
         return code_md
 
-    def _build_feedback_md(self, data: Dict[str, Any], files_by_path: Dict[str, Dict[str, Any]],
-                           separate_names: Dict[str, str], with_code: bool) -> str:
+    def _build_feedback_md(self, sources: List[Dict[str, Any]], with_code: bool, grouped: bool) -> str:
         """
         Build the Feedback.md content.
 
@@ -1397,29 +1499,54 @@ class GitHubParser:
         whether or not its file matches Ignore.txt: the ignore list decides
         what goes into Code.md, not which feedback is worth reading.
 
-        Review verdicts and their summaries come first, then conversation
-        comments, then inline comment threads grouped by file in Code.md
-        order and sorted by line.
+        A single source gets "## Reviews", "## Conversation" and "## Comments".
+        A run with several PRs gets one "## <group>" per source (its category
+        from Repositories.txt, or its repository name) holding the same blocks
+        one level down, so the feedback of a backend PR and a frontend PR
+        stays apart.
 
         Args:
-            data: Unified data dict from :meth:`fetch_data`
-            files_by_path: Every changed file, keyed by path
-            separate_names: Output file name of each separately extracted file
+            sources: Source dicts prepared by :meth:`generate_markdown_sections`
             with_code: True when Code.md and the separate files are written in
                 the same run, so comments can say where their file's diff is
+            grouped: True when the run has several sources
 
         Returns:
             Feedback.md content
         """
+        if not grouped:
+            body = self._feedback_blocks(sources[0], with_code, level=2)
+            return "# Feedback\n\n" + (body or "No comments found.\n")
+
+        output = "# Feedback\n\n"
+        for source in sources:
+            body = self._feedback_blocks(source, with_code, level=3)
+            output += f"## {source['group']}\n\n" + (body or "No comments found.\n\n")
+        return output
+
+    def _feedback_blocks(self, source: Dict[str, Any], with_code: bool, level: int) -> str:
+        """
+        The review verdicts, conversation comments and inline comment threads
+        of one source, in that order, under headings of the given level.
+
+        Args:
+            source: Source dict prepared by :meth:`generate_markdown_sections`
+            with_code: True when Code.md and the separate files are written too
+            level: Heading level of the Reviews / Conversation / Comments blocks
+
+        Returns:
+            Markdown for the blocks, empty when the source has no feedback
+        """
+        heading = '#' * level
         blocks = []
 
         reviews = [
-            review for review in data.get('reviews', [])
+            review for review in source.get('reviews', [])
             if review.get('state') in REVIEW_VERDICT_STATES
             or (review.get('state') == 'COMMENTED' and (review.get('body') or '').strip())
         ]
         if reviews:
-            block = "## Reviews\n\n"
+            block = f"{heading} Reviews\n\n"
             for review in reviews:
                 label = REVIEW_STATE_LABELS.get(review['state'], review['state'])
                 date = (review.get('submitted_at') or '')[:10]
@@ -1428,36 +1555,40 @@ class GitHubParser:
                 block += (f" →{self._format_comment_body(body)}" if body else '') + "\n\n"
             blocks.append(block)
 
-        if data.get('conversation'):
-            block = "## Conversation\n\n"
-            for comment in data['conversation']:
+        if source.get('conversation'):
+            block = f"{heading} Conversation\n\n"
+            for comment in source['conversation']:
                 date = (comment.get('created_at') or '')[:10]
                 block += (f"- `{self._author(comment)}`" + (f" · {date}" if date else '')
                           + f" →{self._format_comment_body(comment.get('body'))}\n\n")
             blocks.append(block)
 
-        if data.get('comments'):
-            blocks.append("## Comments\n\n" + self._format_comment_threads(
-                data['comments'], files_by_path, separate_names, with_code))
+        if source.get('comments'):
+            blocks.append(f"{heading} Comments\n\n" + self._format_comment_threads(
+                source, with_code, level + 1))
 
-        return "# Feedback\n\n" + (''.join(blocks) if blocks else "No comments found.\n")
+        return ''.join(blocks)
 
-    def _format_comment_threads(self, comments: List[Dict[str, Any]],
-                                files_by_path: Dict[str, Dict[str, Any]],
-                                separate_names: Dict[str, str], with_code: bool) -> str:
+    def _format_comment_threads(self, source: Dict[str, Any], with_code: bool, level: int) -> str:
         """
         Format inline comments as threads, each under a header naming its file
         and what the comment was left on, followed by that code.
 
         Args:
-            comments: Comments anchored to a file
-            files_by_path: Every changed file, keyed by path
-            separate_names: Output file name of each separately extracted file
+            source: Source dict prepared by :meth:`generate_markdown_sections`
+                (its comments, every changed file keyed by path, and the
+                output names of its separately extracted files)
             with_code: True when Code.md and the separate files are written too
+            level: Heading level of the per-file headers
 
         Returns:
             Markdown for the threads
         """
+        comments = source['comments']
+        files_by_path = source['files_by_path']
+        separate_names = source['separate_output_names']
+        heading = '#' * level
+
         ids = {comment.get('id') for comment in comments if comment.get('id') is not None}
         replies: Dict[Any, List[Dict[str, Any]]] = {}
         roots = []
@@ -1476,7 +1607,7 @@ class GitHubParser:
         def thread_order(root):
             path = root.get('path') or ''
             line = root.get('line') or root.get('original_line') or root.get('position') or 0
-            return (self.categorize_file(path), file_order.get(path, len(file_order)), path,
+            return (self.file_category(source, path), file_order.get(path, len(file_order)), path,
                     line, root.get('created_at') or '')
 
         def thread_of(root):
@@ -1495,7 +1626,7 @@ class GitHubParser:
             patch = file_data.get('patch', '') if file_data else ''
 
             target = self._describe_comment_target(root, patch)
-            output += f"### `{path}`" + (f" · {target}" if target else '') + "\n\n"
+            output += f"{heading} `{path}`" + (f" · {target}" if target else '') + "\n\n"
 
             if with_code and path not in noted_paths:
                 note = self._feedback_location_note(path, files_by_path, separate_names)
@@ -1506,7 +1637,10 @@ class GitHubParser:
             snippet = self._comment_snippet(root, patch)
             if snippet:
                 fence = self._code_fence(snippet)
-                output += f"{fence}{self.get_file_extension(path)}\n" + '\n'.join(snippet) + f"\n{fence}\n\n"
+                code = '\n'.join(snippet)
+                if self.extraction_group(path) in REDACTED_GROUPS:
+                    code, _ = self._redact_secrets(code)
+                output += f"{fence}{self.get_file_extension(path)}\n" + code + f"\n{fence}\n\n"
 
             for comment in thread_of(root):
                 output += f"- `{self._author(comment)}` →{self._format_comment_body(comment.get('body'))}\n\n"
@@ -1598,85 +1732,112 @@ class GitHubParser:
             return f" {text}" if text else ''
         return '\n\n' + '\n'.join(f"  {line}" if line.strip() else '' for line in text.split('\n'))
 
-    def generate_markdown_sections(self, data: Dict[str, Any],
+    def generate_markdown_sections(self, sources: List[Dict[str, Any]],
                                    sections: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         """
-        Generate the requested markdown sections.
+        Generate the requested markdown sections for one or more sources.
+
+        Each source (a PR or commit from :meth:`fetch_data`, with the 'group'
+        set by :meth:`parse`) gets its own file bookkeeping, stored on the
+        source dict: ignored_files, separate_extraction_files,
+        separate_output_names, main_output_files and files_by_path. Code.md
+        merges the sources' files by category; with several sources every
+        file sits under its source's group, and separately extracted files
+        get the group as their first output folder so two repositories with
+        the same file path cannot collide.
 
         Args:
-            data: Unified data dict from :meth:`fetch_data`
+            sources: Source dicts, in the order the URLs were given
             sections: Which sections to generate. Any subset of
                 ``code``, ``feedback``. Defaults to all.
 
         Returns:
-            Dictionary containing the requested markdown sections plus file
-            bookkeeping (ignored_files, separate_extraction_files, main_output_files).
+            Dictionary containing the requested markdown sections, the sources
+            and the flattened file bookkeeping across sources.
         """
         sections = list(sections) if sections else list(ALL_SECTIONS)
+        grouped = len(sources) > 1
+        used_names = set()
+        files_by_category: Dict[str, List[Dict[str, Any]]] = {}
 
-        all_files = data['files']
+        for source in sources:
+            all_files = source['files']
+            source['ignored_files'] = [
+                f['filename'] for f in all_files if self.should_ignore(f['filename'])
+            ]
+            source['separate_extraction_files'] = [
+                f for f in all_files if self.should_extract_separately(f['filename'])
+            ]
+            source['separate_output_names'] = self._separate_output_names(
+                [f['filename'] for f in source['separate_extraction_files']],
+                prefix=self._safe_folder_name(source['group']) if grouped else None,
+                used=used_names,
+            )
 
-        ignored_files = [f['filename'] for f in all_files if self.should_ignore(f['filename'])]
-        separate_extraction_files = [
-            f for f in all_files if self.should_extract_separately(f['filename'])
-        ]
-        separate_output_names = self._separate_output_names(
-            [f['filename'] for f in separate_extraction_files]
-        )
+            # Files matched for separate extraction are excluded from the main
+            # output (Code.md) and are represented via standalone files.
+            main_files = [
+                f for f in all_files
+                if not self.should_ignore(f['filename']) and not self.should_extract_separately(f['filename'])
+            ]
+            source['main_output_files'] = [f['filename'] for f in main_files]
+            # Every changed file by path (used by feedback for code context).
+            source['files_by_path'] = {f['filename']: f for f in all_files}
 
-        # Files matched for separate extraction are excluded from the main
-        # output (Code.md) and are represented via standalone files.
-        files = [
-            f for f in all_files
-            if not self.should_ignore(f['filename']) and not self.should_extract_separately(f['filename'])
-        ]
-
-        # Group files by category (used by code).
-        files_by_category = {}
-        for file_data in files:
-            category = self.categorize_file(file_data['filename'])
-            files_by_category.setdefault(category, []).append(file_data)
-
-        # Map every changed file by path (used by feedback for code context).
-        files_by_path = {f['filename']: f for f in all_files}
+            for file_data in main_files:
+                category = self.file_category(source, file_data['filename'])
+                files_by_category.setdefault(category, []).append(file_data)
 
         result: Dict[str, Any] = {
             'sections': sections,
-            'ignored_files': ignored_files,
-            'separate_extraction_files': separate_extraction_files,
-            'separate_output_names': separate_output_names,
-            'main_output_files': [f['filename'] for f in files],
+            'grouped': grouped,
+            'sources': sources,
+            'ignored_files': [path for source in sources for path in source['ignored_files']],
+            'separate_extraction_files': [
+                (source, file_data) for source in sources for file_data in source['separate_extraction_files']
+            ],
+            'main_output_files': [path for source in sources for path in source['main_output_files']],
         }
 
         if 'code' in sections:
             result['code'] = self._build_code_md(files_by_category)
         if 'feedback' in sections:
-            result['feedback'] = self._build_feedback_md(
-                data, files_by_path, separate_output_names, with_code='code' in sections
-            )
+            result['feedback'] = self._build_feedback_md(sources, with_code='code' in sections, grouped=grouped)
 
         return result
 
-    def _separate_output_names(self, paths: List[str]) -> Dict[str, str]:
+    @staticmethod
+    def _safe_folder_name(name: str) -> str:
+        """A group label as a folder name: characters Windows refuses are replaced."""
+        return re.sub(r'[\\/:*?"<>|]+', '_', name or '').strip() or 'Other'
+
+    def _separate_output_names(self, paths: List[str], prefix: Optional[str] = None,
+                               used: Optional[set] = None) -> Dict[str, str]:
         """
         Relative output path of each separately extracted file: its group
-        folder, then the file's own repository path plus '.md', e.g.
-        ``MD/docs/setup.md.md`` or ``Config/src/Api/appsettings.json.md``.
+        folder, the source prefix of a run with several PRs (if any), then
+        the file's own repository path plus '.md', e.g.
+        ``MD/docs/setup.md.md``, ``Config/src/Api/appsettings.json.md`` or
+        ``Config/Backend/src/Api/appsettings.json.md``.
         A leading dot is dropped from folder names (``.github`` -> ``github``)
         so tools that hide dot-folders, such as Obsidian, still show them.
 
         Args:
             paths: Paths of the separately extracted files
+            prefix: Folder inserted after the group folder, or None
+            used: Output names already taken by other sources of the run;
+                updated in place so names stay unique across the run
 
         Returns:
             Output path (forward slashes) for each path
         """
         names: Dict[str, str] = {}
-        used = set()
+        used = used if used is not None else set()
         for path in paths:
             parts = list(PurePosixPath(self._normalize_path(path)).parts)
             folders = [part.lstrip('.') or part for part in parts[:-1]]
-            base = '/'.join([self.extraction_group(path) or 'Other'] + folders + [parts[-1]])
+            group = self.extraction_group(path) or 'Other'
+            base = '/'.join([group] + ([prefix] if prefix else []) + folders + [parts[-1]])
             candidate, counter = f"{base}.md", 2
             while candidate in used:
                 candidate = f"{base}__{counter}.md"
@@ -1685,39 +1846,58 @@ class GitHubParser:
             names[path] = candidate
         return names
 
-    def _output_folder_name(self, kind: str, identifier: str, repo_name: str) -> str:
-        """Build the output folder name for a PR or commit."""
-        safe_repo = repo_name.replace('/', '_')
-        if kind == 'commit':
-            short_sha = identifier[:7]
-            return f"Commit_{short_sha}_{safe_repo}"
-        return f"PR_{identifier}_{safe_repo}"
+    def _output_folder_name(self, sources: List[Dict[str, Any]]) -> str:
+        """
+        Build the output folder name: ``PR_123_owner_repo`` or
+        ``Commit_d974808_owner_repo`` for one source, and the identifiers
+        joined with '&' for several (``PR_21&19_owner_repo``, named after the
+        first source's repository), matching the ``_PR21&19_`` note naming.
+        """
+        labels = [
+            ('PR', source['identifier']) if source['kind'] == 'pull' else ('Commit', source['identifier'][:7])
+            for source in sources
+        ]
+        first = sources[0]
+        safe_repo = f"{first['owner']}_{first['repo']}".replace('/', '_')
+        if len({kind for kind, _ in labels}) == 1:
+            return f"{labels[0][0]}_{'&'.join(identifier for _, identifier in labels)}_{safe_repo}"
+        return '&'.join(f"{kind}_{identifier}" for kind, identifier in labels) + f"_{safe_repo}"
 
-    def save_sections(self, sections: Dict[str, Any], kind: str,
-                      identifier: str, repo_name: str):
+    def save_sections(self, sections: Dict[str, Any]):
         """
         Save the generated sections to separate files in a folder on the desktop.
 
         Only the sections that were requested are written. The ignore/separate
         extraction reports and standalone extraction files are written only when
-        the file-based code section was requested.
+        the file-based code section was requested. ``manifest.json`` is always
+        written: it lists the sources (repository, number, title, branches,
+        category) and every separately extracted file with its section and
+        group, so an importer can place the files without guessing from names.
 
         Args:
             sections: Dictionary from :meth:`generate_markdown_sections`
-            kind: 'pull' or 'commit'
-            identifier: PR number or commit SHA
-            repo_name: Repository name (owner_repo)
         """
         requested = sections.get('sections', list(ALL_SECTIONS))
         file_sections_requested = 'code' in requested
+        sources = sections['sources']
+        grouped = sections['grouped']
 
         desktop = Path.home() / 'Desktop'
-        folder_name = self._output_folder_name(kind, identifier, repo_name)
+        folder_name = self._output_folder_name(sources)
         output_folder = desktop / folder_name
 
         # Create folder
         output_folder.mkdir(exist_ok=True)
         print(f"\nCreating output folder: {output_folder}")
+
+        manifest: Dict[str, Any] = {
+            'generated': datetime.now().astimezone().isoformat(timespec='seconds'),
+            'folder': folder_name,
+            'sections': list(requested),
+            'grouped': grouped,
+            'sources': [self._manifest_source(source, grouped) for source in sources],
+            'files': [],
+        }
 
         # Save Code.md
         if 'code' in sections:
@@ -1736,18 +1916,18 @@ class GitHubParser:
         # The reports and standalone extraction files describe file-level
         # handling, so only emit them when a file-based section was requested.
         if not file_sections_requested:
+            self._write_manifest(output_folder, manifest)
             print(f"\n✓ All files saved to: {output_folder}")
             return
-
-        separate_files = sections.get('separate_extraction_files', [])
-        separate_names = sections.get('separate_output_names') or self._separate_output_names(
-            [f['filename'] for f in separate_files]
-        )
 
         reports_folder = output_folder / 'Reports'
         reports_folder.mkdir(exist_ok=True)
 
+        def labelled(source, path):
+            return f"[{source['group']}] {path}" if grouped else path
+
         # Save Reports/Ignore_Report.txt
+        ignored = [(source, path) for source in sources for path in source['ignored_files']]
         ignore_report_file = reports_folder / 'Ignore_Report.txt'
         with open(ignore_report_file, 'w', encoding='utf-8') as f:
             f.write("# Ignore Report\n")
@@ -1761,32 +1941,52 @@ class GitHubParser:
                 f.write(f"{pattern}\n")
 
             f.write("\n## Ignored Files\n")
-            f.write(f"# Total files ignored: {len(sections['ignored_files'])}\n\n")
-            if sections['ignored_files']:
-                for ignored_file in sorted(sections['ignored_files']):
-                    f.write(f"{ignored_file}\n")
+            f.write(f"# Total files ignored: {len(ignored)}\n\n")
+            if ignored:
+                for source, ignored_file in sorted(ignored, key=lambda item: labelled(*item)):
+                    f.write(f"{labelled(source, ignored_file)}\n")
             else:
                 f.write("(No files were ignored)\n")
-        print(f"  ✓ Saved: Reports/Ignore_Report.txt ({len(sections['ignored_files'])} files ignored)")
+        print(f"  ✓ Saved: Reports/Ignore_Report.txt ({len(ignored)} files ignored)")
 
-        # Save separately extracted file diffs under their group folder,
-        # mirroring the repository path.
+        # Save separately extracted file diffs under their group folder (and
+        # source folder in a run with several PRs), mirroring the repository path.
         generated_extraction_files = []
-        for file_data in separate_files:
+        masked_total = 0
+        for source, file_data in sections['separate_extraction_files']:
             filepath = file_data['filename']
-            output_name = separate_names[filepath]
-            generated_extraction_files.append((filepath, output_name))
+            output_name = source['separate_output_names'][filepath]
+            section = self.extraction_group(filepath) or 'Other'
+            text = self.format_code_changes(file_data)
+            masked = 0
+            if section in REDACTED_GROUPS:
+                text, masked = self._redact_secrets(text)
+                masked_total += masked
+            generated_extraction_files.append((labelled(source, filepath), output_name, masked))
+            manifest['files'].append({
+                'section': section,
+                'group': source['group'] if grouped else None,
+                'source': manifest['sources'][sources.index(source)]['id'],
+                'path': filepath,
+                'status': file_data.get('status'),
+                'output': output_name,
+                'masked_values': masked,
+            })
             output_file = output_folder / output_name
             output_file.parent.mkdir(parents=True, exist_ok=True)
             with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(self.format_code_changes(file_data))
+                f.write(text)
 
         separate_report_file = reports_folder / 'SeparateExtraction_Report.txt'
         with open(separate_report_file, 'w', encoding='utf-8') as f:
             f.write("# Separate Extraction Report\n")
             f.write(
                 "# This report shows which files matched SeparateExtractionList.txt "
-                "and where they were written\n\n"
+                "and where they were written\n"
+            )
+            f.write(
+                f"# Values of secret-looking keys in {', '.join(REDACTED_GROUPS)} files are "
+                f"masked as {SECRET_MASK}; the count follows the file\n\n"
             )
 
             f.write("## Extraction Patterns Used\n")
@@ -1801,47 +2001,128 @@ class GitHubParser:
             f.write("\n## Matched Files\n")
             f.write(f"# Total files matched: {len(generated_extraction_files)}\n\n")
             if generated_extraction_files:
-                for source_file, output_name in sorted(generated_extraction_files):
-                    f.write(f"{source_file} -> {output_name}\n")
+                for source_file, output_name, masked in sorted(generated_extraction_files):
+                    f.write(f"{source_file} -> {output_name}"
+                            + (f" ({masked} value{'s' if masked != 1 else ''} masked)" if masked else '')
+                            + "\n")
             else:
                 f.write("(No files matched)\n")
 
         print(
-            f"  ✓ Saved: {len(separate_files)} separately extracted markdown diff file(s)"
+            f"  ✓ Saved: {len(generated_extraction_files)} separately extracted markdown diff file(s)"
+            + (f", {masked_total} secret value(s) masked" if masked_total else '')
         )
         print("  ✓ Saved: Reports/SeparateExtraction_Report.txt")
 
+        self._write_manifest(output_folder, manifest)
         print(f"\n✓ All files saved to: {output_folder}")
 
-    def parse(self, url: str, sections: Optional[Sequence[str]] = None):
+    @staticmethod
+    def _manifest_source(source: Dict[str, Any], grouped: bool) -> Dict[str, Any]:
+        """The manifest entry of one source: where it came from and what it is."""
+        meta = source.get('meta') or {}
+        entry: Dict[str, Any] = {
+            'id': f"{source['owner']}/{source['repo']}#{source['identifier']}"
+                  if source['kind'] == 'pull' else
+                  f"{source['owner']}/{source['repo']}@{source['identifier'][:7]}",
+            'kind': source['kind'],
+            'owner': source['owner'],
+            'repo': source['repo'],
+            'identifier': source['identifier'],
+            'url': source.get('url') or meta.get('html_url'),
+            'category': source.get('category'),
+            'group': source['group'] if grouped else None,
+        }
+        if source['kind'] == 'pull':
+            entry.update({
+                'title': meta.get('title'),
+                'author': (meta.get('user') or {}).get('login'),
+                'head': (meta.get('head') or {}).get('ref'),
+                'base': (meta.get('base') or {}).get('ref'),
+                'state': 'merged' if meta.get('merged_at') else meta.get('state'),
+                'created_at': meta.get('created_at'),
+                'merged_at': meta.get('merged_at'),
+            })
+        else:
+            commit = meta.get('commit') or {}
+            entry.update({
+                'title': (commit.get('message') or '').split('\n', 1)[0],
+                'author': (meta.get('author') or {}).get('login') or (commit.get('author') or {}).get('name'),
+                'date': (commit.get('author') or {}).get('date'),
+            })
+        entry['files'] = {
+            'code': list(source.get('main_output_files', [])),
+            'ignored': list(source.get('ignored_files', [])),
+            'extracted': dict(source.get('separate_output_names', {})),
+        }
+        return entry
+
+    @staticmethod
+    def _write_manifest(output_folder: Path, manifest: Dict[str, Any]):
+        """Write manifest.json next to the generated files."""
+        with open(output_folder / 'manifest.json', 'w', encoding='utf-8') as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+            f.write('\n')
+        print("  ✓ Saved: manifest.json")
+
+    def parse(self, urls, sections: Optional[Sequence[str]] = None):
         """
-        Main method to parse a PR or commit and generate markdown sections.
+        Main method to parse one or more PRs or commits and generate markdown
+        sections into a single output folder.
+
+        Each URL becomes a source. A source's group (the "## ..." it gets in
+        Code.md, and in Feedback.md and the extracted files when there are
+        several sources) is its repository's category from Repositories.txt;
+        in a run with several sources an unlisted repository is grouped under
+        its own name, so a backend PR and a frontend PR never mix.
 
         Args:
-            url: GitHub PR or commit URL
+            urls: GitHub PR or commit URL, or a list of them
             sections: Which sections to extract (defaults to all)
         """
+        if isinstance(urls, str):
+            urls = [urls]
         try:
             sections = list(sections) if sections else list(ALL_SECTIONS)
-
-            # Parse URL
-            parsed = self.parse_url(url)
-            kind = parsed['kind']
-            subject = 'PR' if kind == 'pull' else 'commit'
-            id_display = parsed['identifier'] if kind == 'pull' else parsed['identifier'][:7]
-            print(f"Parsing {subject} {id_display} from {parsed['owner']}/{parsed['repo']}")
             print(f"Sections: {', '.join(sections)}")
 
-            # Fetch data
-            data = self.fetch_data(parsed)
-            print(
-                f"Found {len(data['files'])} files, {len(data['comments'])} inline comments, "
-                f"{len(data['conversation'])} conversation comments and {len(data['reviews'])} reviews"
-            )
+            parsed_list = [self.parse_url(url.strip()) for url in urls if url and url.strip()]
+            if not parsed_list:
+                raise ValueError("No URL provided")
+            seen = set()
+            for parsed in parsed_list:
+                key = (parsed['owner'].lower(), parsed['repo'].lower(), parsed['kind'], parsed['identifier'].lower())
+                if key in seen:
+                    raise ValueError(f"The same {('PR' if parsed['kind'] == 'pull' else 'commit')} was given twice: "
+                                     f"{parsed['owner']}/{parsed['repo']} {parsed['identifier']}")
+                seen.add(key)
+
+            grouped = len(parsed_list) > 1
+            sources = []
+            for url, parsed in zip([u for u in urls if u and u.strip()], parsed_list):
+                kind = parsed['kind']
+                subject = 'PR' if kind == 'pull' else 'commit'
+                id_display = parsed['identifier'] if kind == 'pull' else parsed['identifier'][:7]
+                print(f"\nParsing {subject} {id_display} from {parsed['owner']}/{parsed['repo']}")
+
+                data = self.fetch_data(parsed)
+                data['url'] = url.strip()
+                data['category'] = self.repository_category(parsed['owner'], parsed['repo'])
+                print(
+                    f"Found {len(data['files'])} files, {len(data['comments'])} inline comments, "
+                    f"{len(data['conversation'])} conversation comments and {len(data['reviews'])} reviews"
+                )
+                sources.append(data)
+
+            self._assign_groups(sources, grouped)
+            for source in sources:
+                where = (f"grouped under '{source['group']}'" if source['group']
+                         else "categorized by Categories.txt")
+                print(f"  {source['owner']}/{source['repo']}: {where}")
 
             # Generate markdown sections
-            print("Generating markdown sections...")
-            generated = self.generate_markdown_sections(data, sections)
+            print("\nGenerating markdown sections...")
+            generated = self.generate_markdown_sections(sources, sections)
 
             # Count files included in the main Code output.
             processed_files = len(generated.get('main_output_files', []))
@@ -1852,14 +2133,34 @@ class GitHubParser:
             )
 
             # Save to desktop in separate files
-            repo_name = f"{parsed['owner']}_{parsed['repo']}"
-            self.save_sections(generated, kind, parsed['identifier'], repo_name)
+            self.save_sections(generated)
 
             print("\n✓ Done!")
 
         except Exception as e:
             print(f"Error: {e}")
             raise
+
+    @staticmethod
+    def _assign_groups(sources: List[Dict[str, Any]], grouped: bool):
+        """
+        Set each source's 'group': its Repositories.txt category, or, in a run
+        with several sources, its repository name when it has none. Two
+        sources that would share a label (two PRs of one repository) get the
+        PR number or commit appended so their files stay apart.
+        """
+        for source in sources:
+            source['group'] = source['category'] or (source['repo'] if grouped else None)
+        if not grouped:
+            return
+        counts: Dict[str, int] = {}
+        for source in sources:
+            counts[source['group']] = counts.get(source['group'], 0) + 1
+        for source in sources:
+            if counts[source['group']] > 1:
+                suffix = (f"PR {source['identifier']}" if source['kind'] == 'pull'
+                          else source['identifier'][:7])
+                source['group'] = f"{source['group']} · {suffix}"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1873,9 +2174,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                'never accepted as a command-line argument.',
     )
     parser.add_argument(
-        'url', nargs='?',
-        help='GitHub PR (.../pull/123) or commit (.../commit/<sha>) URL. '
-             'If omitted, you will be prompted.',
+        'url', nargs='*',
+        help='GitHub PR (.../pull/123) or commit (.../commit/<sha>) URL(s). Several URLs '
+             '(for example a backend PR and its frontend PR) are written to one folder, '
+             'grouped by repository category. If omitted, you will be prompted.',
     )
     parser.add_argument(
         '-s', '--sections', '--only', dest='sections', metavar='LIST',
@@ -1961,6 +2263,15 @@ def main():
     else:
         print("\n⚠ No separate extraction patterns loaded")
         print("  Edit SeparateExtractionList.txt in the repository to configure patterns")
+
+    # Show loaded repository categories
+    if parser.repository_rules:
+        print(f"\nRepository categories loaded from Repositories.txt ({len(parser.repository_rules)} patterns):")
+        for group, pattern in parser.repository_rules:
+            print(f"  - [{group}] {pattern}")
+    else:
+        print("\nℹ No repository categories loaded (Repositories.txt is empty or not found)")
+        print("  Files are categorized by Categories.txt; a run with several PRs groups them by repository name")
     print()
 
     # Resolve which sections to extract.
@@ -1978,18 +2289,21 @@ def main():
         print(f"Error: {e}")
         return
 
-    # Get URL from user (PR or commit).
+    # Get URL(s) from user (PRs or commits).
     if args.url:
-        url = args.url.strip()
+        urls = [url.strip() for url in args.url if url.strip()]
     else:
-        url = input("\nEnter GitHub PR or commit URL: ").strip()
+        raw_urls = input(
+            "\nEnter GitHub PR or commit URL(s), several separated by spaces or commas: "
+        ).strip()
+        urls = [url for url in re.split(r'[,\s]+', raw_urls) if url]
 
-    if not url:
+    if not urls:
         print("Error: No URL provided")
         return
 
-    # Parse the PR or commit.
-    parser.parse(url, sections=sections)
+    # Parse the PR(s) or commit(s).
+    parser.parse(urls, sections=sections)
 
 
 if __name__ == '__main__':

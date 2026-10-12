@@ -8,15 +8,19 @@
 [Frontend]
 ui/*
 frontend/*
+**/*.js
 **/*.ts
 **/*.tsx
 **/*.jsx
 **/*.vue
 
 # Listed after Frontend so an api/ file or a .cs file under ui/ counts as Backend.
+# A repository listed in Repositories.txt skips these rules: all its files get that section.
 [Backend]
 api/*
 **/*.cs
 **/*.java
 **/*.py
 **/*.go
+# Backend resources that are not code but belong with it:
+**/Localization/*

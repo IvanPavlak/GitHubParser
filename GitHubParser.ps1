@@ -22,8 +22,10 @@ function GitHubParser {
 		no echo.
 
 	.PARAMETER Url
-		GitHub pull request (`.../pull/<number>`) or commit (`.../commit/<sha>`) URL. A trailing
-		`#diff-...` fragment is ignored. Prompted if omitted.
+		One or more GitHub pull request (`.../pull/<number>`) or commit (`.../commit/<sha>`) URLs.
+		Several URLs (for example a backend PR and its frontend PR) are written to one output
+		folder, grouped by repository category (Repositories.txt). A trailing `#diff-...`
+		fragment is ignored. Prompted if omitted.
 
 	.PARAMETER Sections
 		Comma-separated sections to extract: `code`, `feedback` (alias:
@@ -54,14 +56,19 @@ function GitHubParser {
 		Extracts code + feedback from a public pull request with no prompts.
 
 	.EXAMPLE
+		GitHubParser -Private https://github.com/owner/api/pull/21 https://github.com/owner/ui/pull/19
+		Extracts a backend PR and its frontend PR into one folder (PR_21&19_owner_api) with
+		Code.md and Feedback.md grouped as Backend, then Frontend.
+
+	.EXAMPLE
 		GitHubParser -Private -Token (Read-Host -AsSecureString) -Only feedback <url>
 		Prompts (no echo) for a token, then extracts feedback from a private repository. The token
 		never appears on the command line, in history, or in any process argument list.
 	#>
 	[CmdletBinding(DefaultParameterSetName = 'Default')]
 	param(
-		[Parameter(Position = 0)]
-		[string]$Url,
+		[Parameter(Position = 0, ValueFromRemainingArguments = $true)]
+		[string[]]$Url,
 
 		[Alias('Only')]
 		[string[]]$Sections,
@@ -82,7 +89,7 @@ function GitHubParser {
 	if ($Sections) { $parserArgs += @('--sections', ($Sections -join ',')) }
 	if ($Private) { $parserArgs += '--private' }
 	if ($Public) { $parserArgs += '--public' }
-	if ($Url) { $parserArgs += $Url }
+	if ($Url) { $parserArgs += @($Url | Where-Object { $_ }) }
 
 	# Capture the current GITHUB_TOKEN so we can restore it afterward; only touch it
 	# when a token was supplied to this call. GetEnvironmentVariable returns $null
